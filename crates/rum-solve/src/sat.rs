@@ -14,11 +14,10 @@
 //!     of gratuitously upgrading them — matching `dnf install` semantics.
 //!
 //! Versioned requirements are expressed as `Ranges<Evr>` over our RPM-correct
-//! `Evr` ordering, so the solver's version choices use real rpmvercmp. The one
-//! approximation is a versioned *virtual* Provides whose version differs from
-//! the providing package's version (rare); such a requirement is matched
-//! against the package version. This yields real backtracking and matches dnf
-//! on ordinary closures.
+//! `Evr` ordering, so the solver's version choices use real rpmvercmp. A
+//! versioned Provides carries its own advertised version; an *unversioned*
+//! Provides is flagged a wildcard and satisfies any require (RPM's rpmdsCompare
+//! rule). This yields real backtracking and matches dnf on ordinary closures.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
@@ -50,6 +49,10 @@ struct RpmProvider {
     /// package version, not the solvable's record (which for a capability
     /// provider is the *provided* version and can tie across package builds).
     pkg_evr: HashMap<SolvableId, Evr>,
+    /// Solvables created from an *unversioned* Provides (or a file). Per RPM's
+    /// `rpmdsCompare`, a versionless provide satisfies ANY versioned require, so
+    /// these must pass the version-set filter unconditionally.
+    wildcard: HashSet<SolvableId>,
 }
 
 /// Requirements rum does not resolve against repo packages:
@@ -95,6 +98,7 @@ fn build(
     let mut candidate_of: HashMap<SolvableId, usize> = HashMap::new();
     let mut installed: HashSet<SolvableId> = HashSet::new();
     let mut pkg_evr: HashMap<SolvableId, Evr> = HashMap::new();
+    let mut wildcard: HashSet<SolvableId> = HashSet::new();
 
     for (ci, c) in candidates.iter().enumerate() {
         // Build the package's requirements once; every provider solvable for
@@ -120,29 +124,33 @@ fn build(
             })
             .collect();
 
-        // Capabilities this package offers: its own name plus every Provides /
-        // file (the provided version, falling back to the package version).
-        let mut caps: Vec<(&str, Evr)> = Vec::with_capacity(c.provides.len() + 1);
-        caps.push((c.name.as_str(), c.evr.clone()));
+        // Capabilities this package offers: its own name (versioned, = package
+        // EVR) plus every Provides / file. A Provides with no version is
+        // unversioned and matches any require (tracked as a wildcard).
+        let mut caps: Vec<(&str, Option<&Evr>)> = Vec::with_capacity(c.provides.len() + 1);
+        caps.push((c.name.as_str(), Some(&c.evr)));
         for p in &c.provides {
-            caps.push((
-                p.name.as_str(),
-                p.evr.clone().unwrap_or_else(|| c.evr.clone()),
-            ));
+            caps.push((p.name.as_str(), p.evr.as_ref()));
         }
 
         let mut done: HashSet<&str> = HashSet::new();
-        for (capname, rec) in caps {
+        for (capname, prov_evr) in caps {
             if !required.contains(capname) || !done.insert(capname) {
                 continue;
             }
             // One provider solvable per (package, capability), interned under
             // the capability name so all providers of a capability share it.
+            // The record is the provided version (or the package version as a
+            // placeholder for unversioned provides, which are flagged wildcard).
             let cap = pool.intern_package_name(capname.to_string());
+            let rec = prov_evr.cloned().unwrap_or_else(|| c.evr.clone());
             let sid = pool.intern_solvable(cap, rec);
             candidate_of.insert(sid, ci);
             pkg_evr.insert(sid, c.evr.clone());
             deps.insert(sid, reqs.clone());
+            if prov_evr.is_none() {
+                wildcard.insert(sid);
+            }
             providers.entry(cap).or_default().push(sid);
         }
     }
@@ -160,6 +168,10 @@ fn build(
         installed.insert(sid);
         pkg_evr.insert(sid, rec);
         deps.insert(sid, Vec::new());
+        // An installed capability with no version (e.g. a file) matches any require.
+        if evr.is_none() {
+            wildcard.insert(sid);
+        }
         providers.entry(cap).or_default().push(sid);
     }
 
@@ -170,6 +182,7 @@ fn build(
         installed,
         candidate_of,
         pkg_evr,
+        wildcard,
     }
 }
 
@@ -221,8 +234,11 @@ impl DependencyProvider for RpmProvider {
             .iter()
             .copied()
             .filter(|s| {
-                let evr = &self.pool.resolve_solvable(*s).record;
-                ranges.contains(evr) != inverse
+                // An unversioned provide (wildcard) matches any require, per
+                // RPM's rpmdsCompare; otherwise range-check the provided version.
+                let matches = self.wildcard.contains(s)
+                    || ranges.contains(&self.pool.resolve_solvable(*s).record);
+                matches != inverse
             })
             .collect()
     }
@@ -455,6 +471,41 @@ mod tests {
         assert!(r.contains(&0), "app selected");
         assert!(r.contains(&1), "fell back to prov-1.0");
         assert!(!r.contains(&2), "prov-2.0 (dead end) not selected");
+    }
+
+    #[test]
+    fn unversioned_provide_satisfies_versioned_require() {
+        // RPM rule: a versionless `Provides: webserver` satisfies
+        // `Requires: webserver >= 5.0`, even though the package is v3.0.
+        let app = Candidate {
+            id: 0,
+            name: "app".into(),
+            arch: "x86_64".into(),
+            evr: Evr::new(Some(0), "1", "1"),
+            provides: vec![],
+            requires: vec![Dep {
+                name: "webserver".into(),
+                flag: DepFlag::Ge,
+                evr: Some(Evr::new(Some(0), "5.0", "")),
+            }],
+            recommends: vec![],
+        };
+        let prov = Candidate {
+            id: 1,
+            name: "prov".into(),
+            arch: "x86_64".into(),
+            evr: Evr::new(Some(0), "3.0", "1"), // package older than the require
+            provides: vec![Dep::unversioned("webserver")], // unversioned provide
+            requires: vec![],
+            recommends: vec![],
+        };
+        let r = resolve_sat(&["app".into()], &[app, prov], &[])
+            .unwrap()
+            .to_install;
+        assert!(
+            r.contains(&1),
+            "unversioned provide must satisfy a versioned require"
+        );
     }
 
     #[test]
