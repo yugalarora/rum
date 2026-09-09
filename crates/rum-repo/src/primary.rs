@@ -13,7 +13,7 @@ use crate::checksum::{Checksum, ChecksumKind};
 use crate::RepoError;
 
 /// A package as advertised by a repository (not necessarily installed).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AvailablePackage {
     pub name: String,
     /// Epoch as advertised; 0 means "no epoch" for display purposes.

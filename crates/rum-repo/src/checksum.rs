@@ -3,7 +3,7 @@
 use sha1::Sha1;
 use sha2::{Digest, Sha256, Sha512};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ChecksumKind {
     Sha1,
     Sha256,
@@ -22,7 +22,7 @@ impl ChecksumKind {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Checksum {
     pub kind: ChecksumKind,
     /// Lowercase hex digest.

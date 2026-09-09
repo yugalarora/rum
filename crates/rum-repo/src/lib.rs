@@ -92,24 +92,27 @@ impl SyncOptions {
 pub fn sync_repo(repo: &Repo, opts: &SyncOptions) -> Result<RepoMetadata, RepoError> {
     let dir = opts.cachedir.join(&repo.id);
     let repomd_path = dir.join("repomd.xml");
-    let primary_path = dir.join("primary.xml");
+    // Parsed-metadata cache: the primary.xml parsed into AvailablePackages and
+    // serialized, so warm runs skip re-parsing tens of MB of XML every time.
+    // Lives entirely under rum's own cachedir (never touches dnf/yum's cache).
+    let primary_bin = dir.join("primary.bin");
     let baseurl_path = dir.join("baseurl");
 
-    // Fast path: fresh cache with a parsed-primary file and a recorded base URL.
-    if !opts.force_refresh && primary_path.exists() && is_fresh(&repomd_path, repo.metadata_expire)
-    {
+    // Fast path: fresh parsed cache plus a recorded base URL.
+    if !opts.force_refresh && primary_bin.exists() && is_fresh(&repomd_path, repo.metadata_expire) {
         if let Ok(base_url) = std::fs::read_to_string(&baseurl_path) {
-            let xml = read_file(&primary_path)?;
-            let packages = primary::parse(&xml, &repo.id)?;
-            tracing::debug!(repo = %repo.id, count = packages.len(), "loaded from cache");
-            return Ok(RepoMetadata {
-                repo_id: repo.id.clone(),
-                packages,
-                from_cache: true,
-                base_url: base_url.trim().to_string(),
-            });
+            let bytes = read_file(&primary_bin)?;
+            if let Ok(packages) = bincode::deserialize::<Vec<AvailablePackage>>(&bytes) {
+                tracing::debug!(repo = %repo.id, count = packages.len(), "loaded parsed cache");
+                return Ok(RepoMetadata {
+                    repo_id: repo.id.clone(),
+                    packages,
+                    from_cache: true,
+                    base_url: base_url.trim().to_string(),
+                });
+            }
+            // Corrupt/old-format cache: fall through and refresh.
         }
-        // No cached base URL (older cache): fall through and refresh.
     }
 
     // Refresh: build an HTTP client honouring this repo's TLS settings, then
@@ -148,9 +151,12 @@ pub fn sync_repo(repo: &Repo, opts: &SyncOptions) -> Result<RepoMetadata, RepoEr
     let packages = primary::parse(&plain, &repo.id)?;
     tracing::info!(repo = %repo.id, count = packages.len(), %base, "refreshed metadata");
 
-    // Persist to cache (best-effort ordering: primary last so a present
-    // primary.xml always has a matching repomd.xml alongside it).
-    write_cache(&dir, &repomd_path, &repomd_bytes, &primary_path, &plain)?;
+    // Persist to cache: repomd.xml (freshness anchor) plus the parsed packages
+    // serialized to primary.bin (write primary.bin last, so a present parsed
+    // cache always has a matching repomd.xml governing its freshness).
+    let encoded = bincode::serialize(&packages)
+        .map_err(|e| RepoError::Xml(format!("failed to serialize metadata cache: {e}")))?;
+    write_cache(&dir, &repomd_path, &repomd_bytes, &primary_bin, &encoded)?;
     let _ = std::fs::write(&baseurl_path, &base);
 
     Ok(RepoMetadata {
@@ -263,12 +269,15 @@ fn read_file(path: &Path) -> Result<Vec<u8>, RepoError> {
     })
 }
 
+/// Write the freshness anchor (repomd.xml) and the parsed-metadata cache
+/// (primary.bin). repomd is written first so the parsed cache never appears
+/// without a repomd governing its freshness.
 fn write_cache(
     dir: &Path,
     repomd_path: &Path,
     repomd: &[u8],
-    primary_path: &Path,
-    primary: &[u8],
+    primary_bin: &Path,
+    parsed: &[u8],
 ) -> Result<(), RepoError> {
     std::fs::create_dir_all(dir).map_err(|source| RepoError::Io {
         path: dir.to_path_buf(),
@@ -278,8 +287,8 @@ fn write_cache(
         path: repomd_path.to_path_buf(),
         source,
     })?;
-    std::fs::write(primary_path, primary).map_err(|source| RepoError::Io {
-        path: primary_path.to_path_buf(),
+    std::fs::write(primary_bin, parsed).map_err(|source| RepoError::Io {
+        path: primary_bin.to_path_buf(),
         source,
     })?;
     Ok(())
