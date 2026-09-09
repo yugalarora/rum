@@ -7,6 +7,7 @@
 
 use quick_xml::events::Event;
 use quick_xml::Reader;
+use rum_solve::{Dep, DepFlag, Evr};
 
 use crate::checksum::{Checksum, ChecksumKind};
 use crate::RepoError;
@@ -28,6 +29,12 @@ pub struct AvailablePackage {
     pub checksum: Checksum,
     /// Which repo this came from (filled in by the caller).
     pub repo_id: String,
+    /// Capabilities this package provides (from `<format><rpm:provides>`).
+    pub provides: Vec<Dep>,
+    /// Capabilities this package requires (from `<format><rpm:requires>`).
+    pub requires: Vec<Dep>,
+    /// File paths this package advertises in primary (satisfy file deps).
+    pub files: Vec<String>,
 }
 
 impl AvailablePackage {
@@ -57,6 +64,8 @@ pub fn parse(xml: &[u8], repo_id: &str) -> Result<Vec<AvailablePackage>, RepoErr
     let mut cur: Option<Builder> = None;
     // Which text-bearing child we're currently capturing.
     let mut field = Field::None;
+    // Which dependency list we're inside (provides/requires), if any.
+    let mut dep_ctx = DepCtx::None;
     // Only capture the top-level package checksum (pkgid="YES"), not the ones
     // nested in <format>.
     let mut depth_in_package = 0i32;
@@ -85,6 +94,14 @@ pub fn parse(xml: &[u8], repo_id: &str) -> Result<Vec<AvailablePackage>, RepoErr
                                 }
                                 b"location" => b.location = attr(&e, b"href"),
                                 b"size" => b.read_size(&e),
+                                b"provides" => dep_ctx = DepCtx::Provides,
+                                b"requires" => dep_ctx = DepCtx::Requires,
+                                b"conflicts" | b"obsoletes" | b"suggests"
+                                | b"recommends" | b"enhances" | b"supplements" => {
+                                    dep_ctx = DepCtx::None
+                                }
+                                b"file" => field = Field::File,
+                                b"entry" => push_entry(b, dep_ctx, &e),
                                 _ => field = Field::None,
                             }
                         }
@@ -100,6 +117,8 @@ pub fn parse(xml: &[u8], repo_id: &str) -> Result<Vec<AvailablePackage>, RepoErr
                         b"version" => b.read_version(&e),
                         b"location" => b.location = attr(&e, b"href"),
                         b"size" => b.read_size(&e),
+                        // <rpm:entry .../> is almost always self-closing.
+                        b"entry" => push_entry(b, dep_ctx, &e),
                         _ => {}
                     }
                 }
@@ -111,6 +130,7 @@ pub fn parse(xml: &[u8], repo_id: &str) -> Result<Vec<AvailablePackage>, RepoErr
                         Field::Name => b.name = text.into_owned(),
                         Field::Arch => b.arch = text.into_owned(),
                         Field::Summary => b.summary = text.into_owned(),
+                        Field::File => b.files.push(text.into_owned()),
                         Field::Checksum => {
                             if let Some(kind) = b.pending_cksum_kind {
                                 b.checksum = Some(Checksum {
@@ -133,6 +153,12 @@ pub fn parse(xml: &[u8], repo_id: &str) -> Result<Vec<AvailablePackage>, RepoErr
                     }
                 } else if cur.is_some() {
                     depth_in_package -= 1;
+                    if matches!(
+                        name.as_slice(),
+                        b"provides" | b"requires" | b"conflicts" | b"obsoletes"
+                    ) {
+                        dep_ctx = DepCtx::None;
+                    }
                 }
                 field = Field::None;
             }
@@ -153,6 +179,43 @@ enum Field {
     Arch,
     Summary,
     Checksum,
+    File,
+}
+
+/// Which dependency list (if any) we're currently inside.
+#[derive(Clone, Copy, PartialEq)]
+enum DepCtx {
+    None,
+    Provides,
+    Requires,
+}
+
+/// Push an `<rpm:entry>` into the provides/requires list per the active context.
+fn push_entry(b: &mut Builder, ctx: DepCtx, e: &quick_xml::events::BytesStart) {
+    if ctx == DepCtx::None {
+        return;
+    }
+    if let Some(d) = read_entry(e) {
+        match ctx {
+            DepCtx::Provides => b.provides.push(d),
+            DepCtx::Requires => b.requires.push(d),
+            DepCtx::None => {}
+        }
+    }
+}
+
+/// Build a `Dep` from an `<rpm:entry .../>` element.
+fn read_entry(e: &quick_xml::events::BytesStart) -> Option<Dep> {
+    let name = attr(e, b"name");
+    if name.is_empty() {
+        return None;
+    }
+    let flag = DepFlag::parse(&attr(e, b"flags"));
+    let evr = attr_opt(e, b"ver").map(|ver| {
+        let epoch = attr_opt(e, b"epoch").and_then(|s| s.parse().ok());
+        Evr::new(epoch, ver, attr_opt(e, b"rel").unwrap_or_default())
+    });
+    Some(Dep { name, flag, evr })
 }
 
 #[derive(Default)]
@@ -167,6 +230,9 @@ struct Builder {
     location: String,
     checksum: Option<Checksum>,
     pending_cksum_kind: Option<ChecksumKind>,
+    provides: Vec<Dep>,
+    requires: Vec<Dep>,
+    files: Vec<String>,
 }
 
 impl Builder {
@@ -193,6 +259,9 @@ impl Builder {
             location: self.location,
             checksum: self.checksum?,
             repo_id: repo_id.to_string(),
+            provides: self.provides,
+            requires: self.requires,
+            files: self.files,
         })
     }
 }
@@ -226,7 +295,16 @@ mod tests {
             <size package="1234" installed="5678" archive="9012"/>
             <location href="Packages/b/bash-5.2.15-1.amzn2023.x86_64.rpm"/>
             <format>
-              <rpm:provides><rpm:entry name="bash"/></rpm:provides>
+              <rpm:provides>
+                <rpm:entry name="bash" flags="EQ" epoch="0" ver="5.2.15" rel="1.amzn2023"/>
+                <rpm:entry name="config(bash)"/>
+              </rpm:provides>
+              <rpm:requires>
+                <rpm:entry name="glibc" flags="GE" epoch="0" ver="2.34"/>
+                <rpm:entry name="/bin/sh"/>
+              </rpm:requires>
+              <file>/usr/bin/bash</file>
+              <file type="dir">/etc/bash</file>
               <checksum>should-not-be-picked</checksum>
             </format>
           </package>
@@ -252,6 +330,16 @@ mod tests {
         assert_eq!(bash.summary, "The GNU Bourne Again shell");
         assert_eq!(bash.checksum.hex, "deadbeef"); // not the <format> one
         assert_eq!(bash.repo_id, "baseos");
+
+        // Provides / requires / files parsed from <format>.
+        assert_eq!(bash.provides.len(), 2);
+        assert_eq!(bash.provides[0].name, "bash");
+        assert_eq!(bash.provides[0].flag, rum_solve::DepFlag::Eq);
+        assert_eq!(bash.requires.len(), 2);
+        assert_eq!(bash.requires[0].name, "glibc");
+        assert_eq!(bash.requires[0].flag, rum_solve::DepFlag::Ge);
+        assert!(bash.requires[1].evr.is_none()); // /bin/sh unversioned
+        assert_eq!(bash.files, vec!["/usr/bin/bash", "/etc/bash"]);
 
         let zlib = &pkgs[1];
         assert_eq!(zlib.evr(), "2:1.2.13-3");

@@ -192,6 +192,33 @@ mod imp {
             self.provide_version("system-release(releasever)")
         }
 
+        /// Every Provides capability AND installed file path across all
+        /// packages, as (name, optional version string). Used to prune
+        /// dependencies already satisfied by the system (including file deps
+        /// like `/bin/sh`).
+        pub fn all_provides(&self) -> Vec<(String, Option<String>)> {
+            let mut out = Vec::new();
+            // SAFETY: valid ts; iterate every installed header and read its
+            // provide/file tags, copying strings out immediately.
+            unsafe {
+                let mi =
+                    ffi::rpmtsInitIterator(self.ts, ffi::RPMDBI_PACKAGES, ptr::null(), 0);
+                if mi.is_null() {
+                    return out;
+                }
+                loop {
+                    let h = ffi::rpmdbNextIterator(mi);
+                    if h.is_null() {
+                        break;
+                    }
+                    collect_capabilities(h, &mut out);
+                    collect_files(h, &mut out);
+                }
+                ffi::rpmdbFreeIterator(mi);
+            }
+            out
+        }
+
         fn iter_with(&self, tag: ffi::rpmTagVal, key: Option<&str>) -> Vec<Package> {
             let ckey = key.map(|k| CString::new(k).unwrap());
             let (keyp, keylen) = match &ckey {
@@ -268,6 +295,100 @@ mod imp {
         out
     }
 
+    /// Collect a header's Provides capabilities as (name, optional version).
+    unsafe fn collect_capabilities(h: ffi::Header, out: &mut Vec<(String, Option<String>)>) {
+        let names = ffi::rpmtdNew();
+        let vers = ffi::rpmtdNew();
+        let have_v = ffi::headerGet(h, ffi::RPMTAG_PROVIDEVERSION, vers, 0) != 0;
+        if ffi::headerGet(h, ffi::RPMTAG_PROVIDENAME, names, 0) != 0 {
+            ffi::rpmtdInit(names);
+            loop {
+                let idx = ffi::rpmtdNext(names);
+                if idx < 0 {
+                    break;
+                }
+                let np = ffi::rpmtdGetString(names);
+                if np.is_null() {
+                    continue;
+                }
+                let name = CStr::from_ptr(np).to_string_lossy().into_owned();
+                let ver = if have_v {
+                    ffi::rpmtdSetIndex(vers, idx);
+                    let vp = ffi::rpmtdGetString(vers);
+                    if vp.is_null() {
+                        None
+                    } else {
+                        let s = CStr::from_ptr(vp).to_string_lossy().into_owned();
+                        if s.is_empty() {
+                            None
+                        } else {
+                            Some(s)
+                        }
+                    }
+                } else {
+                    None
+                };
+                out.push((name, ver));
+            }
+        }
+        ffi::rpmtdFreeData(names);
+        ffi::rpmtdFree(names);
+        ffi::rpmtdFreeData(vers);
+        ffi::rpmtdFree(vers);
+    }
+
+    /// Collect a header's file paths (reconstructed from basenames + dir
+    /// index + dirnames), pushed as unversioned provides.
+    unsafe fn collect_files(h: ffi::Header, out: &mut Vec<(String, Option<String>)>) {
+        let dirnames_td = ffi::rpmtdNew();
+        let base_td = ffi::rpmtdNew();
+        let didx_td = ffi::rpmtdNew();
+
+        let mut dirs: Vec<String> = Vec::new();
+        if ffi::headerGet(h, ffi::RPMTAG_DIRNAMES, dirnames_td, 0) != 0 {
+            ffi::rpmtdInit(dirnames_td);
+            loop {
+                if ffi::rpmtdNext(dirnames_td) < 0 {
+                    break;
+                }
+                let p = ffi::rpmtdGetString(dirnames_td);
+                dirs.push(if p.is_null() {
+                    String::new()
+                } else {
+                    CStr::from_ptr(p).to_string_lossy().into_owned()
+                });
+            }
+        }
+
+        let have_idx = ffi::headerGet(h, ffi::RPMTAG_DIRINDEXES, didx_td, 0) != 0;
+        if !dirs.is_empty() && have_idx && ffi::headerGet(h, ffi::RPMTAG_BASENAMES, base_td, 0) != 0
+        {
+            ffi::rpmtdInit(base_td);
+            loop {
+                let idx = ffi::rpmtdNext(base_td);
+                if idx < 0 {
+                    break;
+                }
+                let bp = ffi::rpmtdGetString(base_td);
+                if bp.is_null() {
+                    continue;
+                }
+                let base = CStr::from_ptr(bp).to_string_lossy();
+                ffi::rpmtdSetIndex(didx_td, idx);
+                let di = ffi::rpmtdGetNumber(didx_td) as usize;
+                let dir = dirs.get(di).map(String::as_str).unwrap_or("");
+                out.push((format!("{dir}{base}"), None));
+            }
+        }
+
+        ffi::rpmtdFreeData(dirnames_td);
+        ffi::rpmtdFree(dirnames_td);
+        ffi::rpmtdFreeData(base_td);
+        ffi::rpmtdFree(base_td);
+        ffi::rpmtdFreeData(didx_td);
+        ffi::rpmtdFree(didx_td);
+    }
+
     impl Drop for Rpmdb {
         fn drop(&mut self) {
             // SAFETY: ts was created by rpmtsCreate and not freed elsewhere.
@@ -297,6 +418,9 @@ impl Rpmdb {
     }
     pub fn releasever(&self) -> Option<String> {
         None
+    }
+    pub fn all_provides(&self) -> Vec<(String, Option<String>)> {
+        Vec::new()
     }
 }
 

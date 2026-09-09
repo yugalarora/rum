@@ -579,6 +579,7 @@ dependencies = [
  "lzma-rs",
  "quick-xml",
  "rum-config",
+ "rum-solve",
  "ruzstd",
  "sha1",
  "sha2",
@@ -598,6 +599,9 @@ dependencies = [
 [[package]]
 name = "rum-solve"
 version = "0.1.0"
+dependencies = [
+ "thiserror",
+]
 
 [[package]]
 name = "rustls"

@@ -33,6 +33,9 @@ pub const RPMTAG_ARCH: rpmTagVal = 1022;
 pub const RPMTAG_INSTALLTIME: rpmTagVal = 1008;
 pub const RPMTAG_PROVIDENAME: rpmTagVal = 1047;
 pub const RPMTAG_PROVIDEVERSION: rpmTagVal = 1113;
+pub const RPMTAG_BASENAMES: rpmTagVal = 1117;
+pub const RPMTAG_DIRINDEXES: rpmTagVal = 1116;
+pub const RPMTAG_DIRNAMES: rpmTagVal = 1118;
 
 // rpmDbiTag values (from rpmdb.h). RPMDBI_PACKAGES iterates every installed
 // header; a plain RPMTAG_* value keys the iterator by that tag.
@@ -86,4 +89,6 @@ extern "C" {
     pub fn rpmtdSetIndex(td: rpmtd, index: c_int) -> c_int;
     /// Current string element (NULL if not a string / out of range).
     pub fn rpmtdGetString(td: rpmtd) -> *const c_char;
+    /// Current numeric element (0 if not numeric / out of range).
+    pub fn rpmtdGetNumber(td: rpmtd) -> u64;
 }

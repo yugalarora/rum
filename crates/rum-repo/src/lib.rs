@@ -63,6 +63,9 @@ pub struct RepoMetadata {
     pub packages: Vec<AvailablePackage>,
     /// True if served from the local cache without hitting the network.
     pub from_cache: bool,
+    /// The base URL the metadata was fetched from; package `location` hrefs are
+    /// relative to this. Needed to build RPM download URLs.
+    pub base_url: String,
 }
 
 /// Options controlling a sync.
@@ -88,20 +91,25 @@ pub fn sync_repo(http: &Http, repo: &Repo, opts: &SyncOptions) -> Result<RepoMet
     let dir = opts.cachedir.join(&repo.id);
     let repomd_path = dir.join("repomd.xml");
     let primary_path = dir.join("primary.xml");
+    let baseurl_path = dir.join("baseurl");
 
-    // Fast path: fresh cache with a parsed-primary file already present.
+    // Fast path: fresh cache with a parsed-primary file and a recorded base URL.
     if !opts.force_refresh
         && primary_path.exists()
         && is_fresh(&repomd_path, repo.metadata_expire)
     {
-        let xml = read_file(&primary_path)?;
-        let packages = primary::parse(&xml, &repo.id)?;
-        tracing::debug!(repo = %repo.id, count = packages.len(), "loaded from cache");
-        return Ok(RepoMetadata {
-            repo_id: repo.id.clone(),
-            packages,
-            from_cache: true,
-        });
+        if let Ok(base_url) = std::fs::read_to_string(&baseurl_path) {
+            let xml = read_file(&primary_path)?;
+            let packages = primary::parse(&xml, &repo.id)?;
+            tracing::debug!(repo = %repo.id, count = packages.len(), "loaded from cache");
+            return Ok(RepoMetadata {
+                repo_id: repo.id.clone(),
+                packages,
+                from_cache: true,
+                base_url: base_url.trim().to_string(),
+            });
+        }
+        // No cached base URL (older cache): fall through and refresh.
     }
 
     // Refresh: resolve mirrors and fetch repomd.xml from the first that works.
@@ -141,11 +149,13 @@ pub fn sync_repo(http: &Http, repo: &Repo, opts: &SyncOptions) -> Result<RepoMet
     // Persist to cache (best-effort ordering: primary last so a present
     // primary.xml always has a matching repomd.xml alongside it).
     write_cache(&dir, &repomd_path, &repomd_bytes, &primary_path, &plain)?;
+    let _ = std::fs::write(&baseurl_path, &base);
 
     Ok(RepoMetadata {
         repo_id: repo.id.clone(),
         packages,
         from_cache: false,
+        base_url: base,
     })
 }
 

@@ -1,5 +1,6 @@
 //! Shared helper: load config and sync all enabled repos into one package list.
 
+use std::collections::HashMap;
 use std::time::Instant;
 
 use rum_repo::{AvailablePackage, SyncOptions};
@@ -11,6 +12,8 @@ pub struct Synced {
     pub packages: Vec<AvailablePackage>,
     /// Per-repo (id, count, from_cache) for reporting.
     pub repos: Vec<RepoStat>,
+    /// repo id -> resolved base URL (for building package download URLs).
+    pub base_urls: HashMap<String, String>,
     pub elapsed: std::time::Duration,
 }
 
@@ -40,9 +43,11 @@ pub fn sync_enabled(force_refresh: bool) -> anyhow::Result<Synced> {
 
     let mut packages = Vec::new();
     let mut repos = Vec::new();
+    let mut base_urls = HashMap::new();
     for (id, res) in results {
         match res {
             Ok(md) => {
+                base_urls.insert(id.clone(), md.base_url);
                 repos.push(RepoStat {
                     id,
                     count: md.packages.len(),
@@ -70,6 +75,7 @@ pub fn sync_enabled(force_refresh: bool) -> anyhow::Result<Synced> {
     Ok(Synced {
         packages,
         repos,
+        base_urls,
         elapsed,
     })
 }

@@ -8,10 +8,14 @@
 //! Milestone 2 (future): full SAT dependency resolution over repo
 //! `provides`/`requires`, likely built on the `resolvo` crate.
 
+mod dep;
+mod resolve;
 mod vercmp;
 
 use std::cmp::Ordering;
 
+pub use dep::{Dep, DepFlag};
+pub use resolve::{resolve, Candidate, ResolveError, Resolved};
 pub use vercmp::rpmvercmp;
 
 /// An epoch:version-release tuple, RPM's unit of "which build is newer".
@@ -29,6 +33,25 @@ impl Evr {
             epoch: epoch.unwrap_or(0),
             version: version.into(),
             release: release.into(),
+        }
+    }
+
+    /// Parse an EVR string of the form `[epoch:]version[-release]`, as stored
+    /// in the rpmdb / repo metadata dependency versions. A missing epoch is 0;
+    /// a missing release is empty (which dep comparison then ignores).
+    pub fn parse(s: &str) -> Self {
+        let (epoch, rest) = match s.split_once(':') {
+            Some((e, r)) => (e.parse::<u64>().unwrap_or(0), r),
+            None => (0, s),
+        };
+        let (version, release) = match rest.split_once('-') {
+            Some((v, r)) => (v.to_string(), r.to_string()),
+            None => (rest.to_string(), String::new()),
+        };
+        Evr {
+            epoch,
+            version,
+            release,
         }
     }
 
@@ -87,5 +110,13 @@ mod tests {
         let pre = Evr::new(Some(0), "1.0~rc1", "1");
         let rel = Evr::new(Some(0), "1.0", "1");
         assert!(pre < rel);
+    }
+
+    #[test]
+    fn parse_evr_forms() {
+        assert_eq!(Evr::parse("2.34-1"), Evr::new(Some(0), "2.34", "1"));
+        assert_eq!(Evr::parse("1:2.34-5.amzn2023"), Evr::new(Some(1), "2.34", "5.amzn2023"));
+        assert_eq!(Evr::parse("2.34"), Evr::new(Some(0), "2.34", ""));
+        assert_eq!(Evr::parse(""), Evr::new(Some(0), "", ""));
     }
 }

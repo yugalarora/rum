@@ -6,3 +6,4 @@ license.workspace = true
 description = "Version comparison (rpmvercmp) and dependency resolution primitives for rum."
 
 [dependencies]
+thiserror.workspace = true

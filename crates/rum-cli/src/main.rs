@@ -73,8 +73,16 @@ enum Command {
     #[command(name = "check-update")]
     CheckUpdate { packages: Vec<String> },
 
-    /// Download packages without installing. [planned]
-    Download { packages: Vec<String> },
+    /// Download packages (optionally with dependencies) without installing.
+    Download {
+        packages: Vec<String>,
+        /// Also download the full dependency closure.
+        #[arg(long)]
+        resolve: bool,
+        /// Directory to write RPMs into (default: current directory).
+        #[arg(long, default_value = ".")]
+        destdir: String,
+    },
 
     /// Refresh and cache repository metadata (like `dnf makecache`). [planned]
     Makecache,
@@ -112,6 +120,11 @@ fn main() -> anyhow::Result<()> {
         Command::Search { terms } => commands::search::run(&terms),
         Command::Makecache => commands::makecache::run(),
         Command::CheckUpdate { packages } => commands::check_update::run(&packages),
+        Command::Download {
+            packages,
+            resolve,
+            destdir,
+        } => commands::download::run(&packages, resolve, std::path::Path::new(&destdir)),
         other => {
             // Every other command is a recognized dnf verb we have not wired
             // up yet. Be explicit rather than silently doing nothing.
