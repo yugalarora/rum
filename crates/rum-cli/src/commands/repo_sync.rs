@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
-use rum_repo::{AvailablePackage, SyncOptions};
+use rum_repo::{AvailablePackage, Http, SyncOptions};
 
 use crate::sys;
 
@@ -14,6 +14,9 @@ pub struct Synced {
     pub repos: Vec<RepoStat>,
     /// repo id -> resolved base URL (for building package download URLs).
     pub base_urls: HashMap<String, String>,
+    /// repo id -> HTTP client honouring that repo's TLS settings (for
+    /// downloading packages, e.g. from mutual-TLS RHUI repos).
+    pub clients: HashMap<String, Http>,
     pub elapsed: std::time::Duration,
 }
 
@@ -32,6 +35,15 @@ pub fn sync_enabled(force_refresh: bool) -> anyhow::Result<Synced> {
     let config = sys::load_config()?;
 
     let enabled = config.enabled_repos();
+
+    // Per-repo HTTP clients (carry TLS client certs for mutual-TLS repos).
+    let mut clients = HashMap::new();
+    for r in &enabled {
+        if let Ok(http) = Http::for_repo(r) {
+            clients.insert(r.id.clone(), http);
+        }
+    }
+
     let opts = SyncOptions {
         cachedir: sys::effective_cachedir(&config.main.cachedir),
         force_refresh,
@@ -76,6 +88,7 @@ pub fn sync_enabled(force_refresh: bool) -> anyhow::Result<Synced> {
         packages,
         repos,
         base_urls,
+        clients,
         elapsed,
     })
 }

@@ -88,18 +88,16 @@ pub fn parse(xml: &[u8], repo_id: &str) -> Result<Vec<AvailablePackage>, RepoErr
                                 b"summary" => field = Field::Summary,
                                 b"version" => b.read_version(&e),
                                 b"checksum" if depth_in_package == 1 => {
-                                    b.pending_cksum_kind = attr_opt(&e, b"type")
-                                        .and_then(|s| ChecksumKind::parse(&s));
+                                    b.pending_cksum_kind =
+                                        attr_opt(&e, b"type").and_then(|s| ChecksumKind::parse(&s));
                                     field = Field::Checksum;
                                 }
                                 b"location" => b.location = attr(&e, b"href"),
                                 b"size" => b.read_size(&e),
                                 b"provides" => dep_ctx = DepCtx::Provides,
                                 b"requires" => dep_ctx = DepCtx::Requires,
-                                b"conflicts" | b"obsoletes" | b"suggests"
-                                | b"recommends" | b"enhances" | b"supplements" => {
-                                    dep_ctx = DepCtx::None
-                                }
+                                b"conflicts" | b"obsoletes" | b"suggests" | b"recommends"
+                                | b"enhances" | b"supplements" => dep_ctx = DepCtx::None,
                                 b"file" => field = Field::File,
                                 b"entry" => push_entry(b, dep_ctx, &e),
                                 _ => field = Field::None,
@@ -237,12 +235,16 @@ struct Builder {
 
 impl Builder {
     fn read_version(&mut self, e: &quick_xml::events::BytesStart) {
-        self.epoch = attr_opt(e, b"epoch").and_then(|s| s.parse().ok()).unwrap_or(0);
+        self.epoch = attr_opt(e, b"epoch")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
         self.version = attr(e, b"ver");
         self.release = attr(e, b"rel");
     }
     fn read_size(&mut self, e: &quick_xml::events::BytesStart) {
-        self.size = attr_opt(e, b"package").and_then(|s| s.parse().ok()).unwrap_or(0);
+        self.size = attr_opt(e, b"package")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
     }
     fn finish(self, repo_id: &str) -> Option<AvailablePackage> {
         if self.name.is_empty() || self.version.is_empty() || self.location.is_empty() {

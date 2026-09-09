@@ -3,7 +3,7 @@
 
 use std::path::{Path, PathBuf};
 
-use rum_config::{Config, Paths, Vars};
+use rum_config::{Config, Paths, RepoSource, Vars};
 use rum_rpm::Rpmdb;
 
 /// Load system config with a dnf-accurate `$releasever`.
@@ -28,8 +28,37 @@ pub fn load_config() -> anyhow::Result<Config> {
         }
     }
 
-    Config::load_with(&Paths::default(), vars)
-        .map_err(|e| anyhow::anyhow!("failed to load configuration: {e}"))
+    let mut config = Config::load_with(&Paths::default(), vars)
+        .map_err(|e| anyhow::anyhow!("failed to load configuration: {e}"))?;
+    substitute_region(&mut config);
+    Ok(config)
+}
+
+/// Red Hat RHUI repo URLs contain the literal token `REGION`, which the AWS
+/// `amazon-id` dnf plugin rewrites to the instance's region. Replicate that:
+/// if any repo references `REGION`, detect the region via IMDS and substitute.
+fn substitute_region(config: &mut Config) {
+    let uses_region = config.repos.iter().any(|r| match &r.source {
+        RepoSource::BaseUrls(urls) => urls.iter().any(|u| u.contains("REGION")),
+        RepoSource::MirrorList(u) | RepoSource::MetaLink(u) => u.contains("REGION"),
+    });
+    if !uses_region {
+        return;
+    }
+    let Some(region) = rum_repo::detect_aws_region() else {
+        // Leave URLs as-is; the repo will fail with a clear DNS error rather
+        // than silently using a wrong endpoint.
+        return;
+    };
+    for repo in &mut config.repos {
+        repo.source = match &repo.source {
+            RepoSource::BaseUrls(urls) => {
+                RepoSource::BaseUrls(urls.iter().map(|u| u.replace("REGION", &region)).collect())
+            }
+            RepoSource::MirrorList(u) => RepoSource::MirrorList(u.replace("REGION", &region)),
+            RepoSource::MetaLink(u) => RepoSource::MetaLink(u.replace("REGION", &region)),
+        };
+    }
 }
 
 /// The cache directory to actually use.

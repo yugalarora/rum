@@ -87,15 +87,14 @@ pub fn rpmvercmp(a: &str, b: &str) -> Ordering {
         // and the corresponding run from `b`.
         let seg1_start = i;
         let seg2_start = j;
-        let isnum;
-        if is_digit(a[i]) {
+        let isnum = is_digit(a[i]);
+        if isnum {
             while i < a.len() && is_digit(a[i]) {
                 i += 1;
             }
             while j < b.len() && is_digit(b[j]) {
                 j += 1;
             }
-            isnum = true;
         } else {
             while i < a.len() && is_alpha(a[i]) {
                 i += 1;
@@ -103,7 +102,6 @@ pub fn rpmvercmp(a: &str, b: &str) -> Ordering {
             while j < b.len() && is_alpha(b[j]) {
                 j += 1;
             }
-            isnum = false;
         }
 
         let mut seg1 = &a[seg1_start..i];
@@ -112,7 +110,11 @@ pub fn rpmvercmp(a: &str, b: &str) -> Ordering {
         // seg1 is guaranteed non-empty (a[seg1_start] was alnum). If seg2 is
         // empty, the two segments are of different types: numeric is newer.
         if seg2.is_empty() {
-            return if isnum { Ordering::Greater } else { Ordering::Less };
+            return if isnum {
+                Ordering::Greater
+            } else {
+                Ordering::Less
+            };
         }
 
         if isnum {
@@ -207,9 +209,16 @@ mod tests {
     fn rpm_regression_suite() {
         for (a, b, want) in CASES {
             let got = rpmvercmp(a, b);
-            assert_eq!(got, *want, "rpmvercmp({a:?}, {b:?}) = {got:?}, want {want:?}");
+            assert_eq!(
+                got, *want,
+                "rpmvercmp({a:?}, {b:?}) = {got:?}, want {want:?}"
+            );
             // Antisymmetry: swapping arguments reverses the result.
-            assert_eq!(rpmvercmp(b, a), want.reverse(), "antisymmetry for {a:?} vs {b:?}");
+            assert_eq!(
+                rpmvercmp(b, a),
+                want.reverse(),
+                "antisymmetry for {a:?} vs {b:?}"
+            );
         }
     }
 }

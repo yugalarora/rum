@@ -36,8 +36,18 @@ pub fn run(patterns: &[String]) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let name_w = updates.iter().map(|(k, ..)| k.len()).max().unwrap_or(20).max(20);
-    let evr_w = updates.iter().map(|(_, e, _)| e.len()).max().unwrap_or(12).max(12);
+    let name_w = updates
+        .iter()
+        .map(|(k, ..)| k.len())
+        .max()
+        .unwrap_or(20)
+        .max(20);
+    let evr_w = updates
+        .iter()
+        .map(|(_, e, _)| e.len())
+        .max()
+        .unwrap_or(12)
+        .max(12);
     for (name, evr, repo) in &updates {
         println!("{name:<name_w$}  {evr:<evr_w$}  {repo}");
     }

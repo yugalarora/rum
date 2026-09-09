@@ -17,7 +17,9 @@ pub struct Vars {
 impl Vars {
     /// Build an empty set (useful for tests).
     pub fn empty() -> Self {
-        Vars { map: HashMap::new() }
+        Vars {
+            map: HashMap::new(),
+        }
     }
 
     pub fn insert(&mut self, key: impl Into<String>, val: impl Into<String>) {
@@ -169,7 +171,11 @@ fn load_var_dir(dir: &Path, map: &mut HashMap<String, String>) {
         };
         if let Ok(content) = std::fs::read_to_string(&path) {
             // Value is the first non-empty line, trimmed.
-            let val = content.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
+            let val = content
+                .lines()
+                .find(|l| !l.trim().is_empty())
+                .unwrap_or("")
+                .trim();
             map.insert(name.to_string(), val.to_string());
         }
     }

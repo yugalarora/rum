@@ -188,7 +188,10 @@ fn collect_repos(ini: &Ini, main: &MainConfig, vars: &Vars, out: &mut Vec<Repo>)
                 .map(|s| expand(s))
                 .unwrap_or_else(|| section.name.clone()),
             source,
-            enabled: e.get("enabled").map(|v| parse_bool(v, true)).unwrap_or(true),
+            enabled: e
+                .get("enabled")
+                .map(|v| parse_bool(v, true))
+                .unwrap_or(true),
             gpgcheck,
             repo_gpgcheck: e
                 .get("repo_gpgcheck")
@@ -203,6 +206,13 @@ fn collect_repos(ini: &Ini, main: &MainConfig, vars: &Vars, out: &mut Vec<Repo>)
                 .get("metadata_expire")
                 .map(|v| parse_duration_secs(v, main.metadata_expire))
                 .unwrap_or(main.metadata_expire),
+            sslclientcert: e.get("sslclientcert").map(|s| expand(s)),
+            sslclientkey: e.get("sslclientkey").map(|s| expand(s)),
+            sslcacert: e.get("sslcacert").map(|s| expand(s)),
+            sslverify: e
+                .get("sslverify")
+                .map(|v| parse_bool(v, true))
+                .unwrap_or(true),
         };
         out.push(repo);
     }

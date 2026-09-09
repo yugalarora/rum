@@ -42,7 +42,8 @@ fn gunzip(data: &[u8]) -> Result<Vec<u8>, DecompressError> {
 fn unxz(data: &[u8]) -> Result<Vec<u8>, DecompressError> {
     let mut out = Vec::new();
     let mut reader = std::io::BufReader::new(data);
-    lzma_rs::xz_decompress(&mut reader, &mut out).map_err(|e| DecompressError::Xz(e.to_string()))?;
+    lzma_rs::xz_decompress(&mut reader, &mut out)
+        .map_err(|e| DecompressError::Xz(e.to_string()))?;
     Ok(out)
 }
 

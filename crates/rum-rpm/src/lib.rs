@@ -201,8 +201,7 @@ mod imp {
             // SAFETY: valid ts; iterate every installed header and read its
             // provide/file tags, copying strings out immediately.
             unsafe {
-                let mi =
-                    ffi::rpmtsInitIterator(self.ts, ffi::RPMDBI_PACKAGES, ptr::null(), 0);
+                let mi = ffi::rpmtsInitIterator(self.ts, ffi::RPMDBI_PACKAGES, ptr::null(), 0);
                 if mi.is_null() {
                     return out;
                 }

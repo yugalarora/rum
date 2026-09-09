@@ -5,21 +5,24 @@
 //! candidate. These back `check-update`, latest-only listing, and upgrade
 //! decisions.
 //!
-//! Milestone 2 (future): full SAT dependency resolution over repo
-//! `provides`/`requires`, likely built on the `resolvo` crate.
+//! SAT dependency resolution over repo `provides`/`requires` is provided by
+//! [`resolve_sat`] (backed by the `resolvo` crate); [`resolve`] is the simpler
+//! greedy resolver kept as a fallback and for reference.
 
 mod dep;
 mod resolve;
+mod sat;
 mod vercmp;
 
 use std::cmp::Ordering;
 
 pub use dep::{Dep, DepFlag};
 pub use resolve::{resolve, Candidate, ResolveError, Resolved};
+pub use sat::resolve_sat;
 pub use vercmp::rpmvercmp;
 
 /// An epoch:version-release tuple, RPM's unit of "which build is newer".
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Evr {
     /// A missing epoch is treated as 0 (RPM/dnf convention).
     pub epoch: u64,
@@ -67,13 +70,23 @@ impl Evr {
 
 impl PartialOrd for Evr {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.compare(other))
+        Some(self.cmp(other))
     }
 }
 
 impl Ord for Evr {
     fn cmp(&self, other: &Self) -> Ordering {
         self.compare(other)
+    }
+}
+
+impl std::fmt::Display for Evr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.epoch == 0 {
+            write!(f, "{}-{}", self.version, self.release)
+        } else {
+            write!(f, "{}:{}-{}", self.epoch, self.version, self.release)
+        }
     }
 }
 
@@ -115,7 +128,10 @@ mod tests {
     #[test]
     fn parse_evr_forms() {
         assert_eq!(Evr::parse("2.34-1"), Evr::new(Some(0), "2.34", "1"));
-        assert_eq!(Evr::parse("1:2.34-5.amzn2023"), Evr::new(Some(1), "2.34", "5.amzn2023"));
+        assert_eq!(
+            Evr::parse("1:2.34-5.amzn2023"),
+            Evr::new(Some(1), "2.34", "5.amzn2023")
+        );
         assert_eq!(Evr::parse("2.34"), Evr::new(Some(0), "2.34", ""));
         assert_eq!(Evr::parse(""), Evr::new(Some(0), "", ""));
     }

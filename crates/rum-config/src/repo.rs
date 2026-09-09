@@ -30,6 +30,14 @@ pub struct Repo {
     pub priority: i32,
     /// Metadata freshness window in seconds (dnf `metadata_expire`).
     pub metadata_expire: i64,
+    /// TLS client certificate (PEM) for mutual-TLS repos (e.g. Red Hat RHUI).
+    pub sslclientcert: Option<String>,
+    /// TLS client private key (PEM) paired with `sslclientcert`.
+    pub sslclientkey: Option<String>,
+    /// Extra CA bundle (PEM) to trust for the repo's TLS server.
+    pub sslcacert: Option<String>,
+    /// Whether to verify the repo's TLS certificate (dnf `sslverify`).
+    pub sslverify: bool,
 }
 
 /// The `[main]` section: global defaults.
@@ -84,7 +92,10 @@ pub(crate) fn parse_duration_secs(s: &str, default: i64) -> i64 {
         Some('d') | Some('D') => (&s[..s.len() - 1], 86400),
         _ => (s, 1),
     };
-    num.trim().parse::<i64>().map(|n| n * mult).unwrap_or(default)
+    num.trim()
+        .parse::<i64>()
+        .map(|n| n * mult)
+        .unwrap_or(default)
 }
 
 #[cfg(test)]

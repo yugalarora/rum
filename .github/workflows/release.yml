@@ -1,0 +1,50 @@
+name: Release
+
+# Build and publish a release binary when changes land on main.
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: build & release
+    runs-on: ubuntu-latest
+    # Build inside Rocky Linux 9 so the binary links a representative librpm
+    # (rpm 4.16, matching Amazon Linux 2023 / RHEL 9 era targets).
+    container: rockylinux:9
+    steps:
+      - name: Install toolchain
+        run: |
+          dnf install -y gcc rpm-devel popt-devel openssl-devel pkgconfig cargo rust git tar gzip
+
+      - uses: actions/checkout@v4
+
+      - name: Build release
+        run: cargo build --release --workspace
+
+      - name: Package
+        id: package
+        run: |
+          version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          arch=$(uname -m)
+          name="rum-${version}-${arch}-linux"
+          install -Dm755 target/release/rum "dist/${name}/rum"
+          cp README.md LICENSE "dist/${name}/" 2>/dev/null || true
+          tar -C dist -czf "${name}.tar.gz" "${name}"
+          sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "asset=${name}.tar.gz" >> "$GITHUB_OUTPUT"
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.package.outputs.version }}.${{ github.run_number }}
+          name: rum v${{ steps.package.outputs.version }} (build ${{ github.run_number }})
+          files: |
+            ${{ steps.package.outputs.asset }}
+            ${{ steps.package.outputs.asset }}.sha256
+          generate_release_notes: true

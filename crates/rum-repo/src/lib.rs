@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 pub use checksum::{Checksum, ChecksumKind};
-pub use http::Http;
+pub use http::{detect_aws_region, Http};
 pub use primary::AvailablePackage;
 pub use repomd::{RepoMd, RepoMdData};
 
@@ -46,6 +46,8 @@ pub enum RepoError {
     ChecksumMismatch { repo: String, file: String },
     #[error("xml parse error: {0}")]
     Xml(String),
+    #[error("tls configuration error: {0}")]
+    Tls(String),
     #[error("decompression error: {0}")]
     Decompress(#[from] decompress::DecompressError),
     #[error("i/o error at {path}: {source}")]
@@ -87,16 +89,14 @@ impl SyncOptions {
 }
 
 /// Sync a single repository, returning its available packages.
-pub fn sync_repo(http: &Http, repo: &Repo, opts: &SyncOptions) -> Result<RepoMetadata, RepoError> {
+pub fn sync_repo(repo: &Repo, opts: &SyncOptions) -> Result<RepoMetadata, RepoError> {
     let dir = opts.cachedir.join(&repo.id);
     let repomd_path = dir.join("repomd.xml");
     let primary_path = dir.join("primary.xml");
     let baseurl_path = dir.join("baseurl");
 
     // Fast path: fresh cache with a parsed-primary file and a recorded base URL.
-    if !opts.force_refresh
-        && primary_path.exists()
-        && is_fresh(&repomd_path, repo.metadata_expire)
+    if !opts.force_refresh && primary_path.exists() && is_fresh(&repomd_path, repo.metadata_expire)
     {
         if let Ok(base_url) = std::fs::read_to_string(&baseurl_path) {
             let xml = read_file(&primary_path)?;
@@ -112,15 +112,17 @@ pub fn sync_repo(http: &Http, repo: &Repo, opts: &SyncOptions) -> Result<RepoMet
         // No cached base URL (older cache): fall through and refresh.
     }
 
-    // Refresh: resolve mirrors and fetch repomd.xml from the first that works.
+    // Refresh: build an HTTP client honouring this repo's TLS settings, then
+    // resolve mirrors and fetch repomd.xml from the first that works.
+    let http = Http::for_repo(repo)?;
     let bases = http.resolve_baseurls(&repo.source)?;
-    let (base, repomd_bytes) = fetch_repomd(http, &repo.id, &bases)?;
+    let (base, repomd_bytes) = fetch_repomd(&http, &repo.id, &bases)?;
     let repomd_str = String::from_utf8_lossy(&repomd_bytes);
     let md = RepoMd::parse(&repomd_str)?;
 
-    let primary_entry = md
-        .get("primary")
-        .ok_or_else(|| RepoError::NoPrimary { repo: repo.id.clone() })?;
+    let primary_entry = md.get("primary").ok_or_else(|| RepoError::NoPrimary {
+        repo: repo.id.clone(),
+    })?;
 
     // Download the primary file and verify its (compressed) checksum.
     let primary_url = join_url(&base, &primary_entry.location);
@@ -179,15 +181,17 @@ pub fn sync_all<'a>(
 
     std::thread::scope(|scope| {
         // Simple static chunking across worker threads.
-        let chunks: Vec<&[&Repo]> = repos.chunks(repos.len().div_ceil(max_threads).max(1)).collect();
+        let chunks: Vec<&[&Repo]> = repos
+            .chunks(repos.len().div_ceil(max_threads).max(1))
+            .collect();
         let mut handles = Vec::new();
         for chunk in chunks {
             handles.push(scope.spawn(move || {
-                // One HTTP agent per worker (connection pool per thread).
-                let http = Http::new();
+                // Each repo builds its own client (it may carry a distinct TLS
+                // client certificate, e.g. Red Hat RHUI).
                 chunk
                     .iter()
-                    .map(|r| (r.id.clone(), sync_repo(&http, r, opts)))
+                    .map(|r| (r.id.clone(), sync_repo(r, opts)))
                     .collect::<Vec<_>>()
             }));
         }
@@ -245,7 +249,11 @@ fn is_fresh(path: &Path, expire: i64) -> bool {
 }
 
 fn join_url(base: &str, href: &str) -> String {
-    format!("{}/{}", base.trim_end_matches('/'), href.trim_start_matches('/'))
+    format!(
+        "{}/{}",
+        base.trim_end_matches('/'),
+        href.trim_start_matches('/')
+    )
 }
 
 fn read_file(path: &Path) -> Result<Vec<u8>, RepoError> {
@@ -283,8 +291,14 @@ mod tests {
 
     #[test]
     fn url_joining() {
-        assert_eq!(join_url("https://a/repo", "repodata/x.gz"), "https://a/repo/repodata/x.gz");
-        assert_eq!(join_url("https://a/repo/", "/repodata/x.gz"), "https://a/repo/repodata/x.gz");
+        assert_eq!(
+            join_url("https://a/repo", "repodata/x.gz"),
+            "https://a/repo/repodata/x.gz"
+        );
+        assert_eq!(
+            join_url("https://a/repo/", "/repodata/x.gz"),
+            "https://a/repo/repodata/x.gz"
+        );
     }
 
     #[test]

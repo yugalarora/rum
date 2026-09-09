@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use super::repo_sync;
 use rum_repo::{AvailablePackage, Http};
-use rum_solve::{resolve, Candidate, Dep, Evr};
+use rum_solve::{resolve_sat, Candidate, Dep, Evr};
 
 pub fn run(packages: &[String], with_deps: bool, destdir: &Path) -> anyhow::Result<()> {
     if packages.is_empty() {
@@ -52,11 +52,15 @@ pub fn resolve_and_fetch(
 
     // Build the candidate universe once. `id` indexes back into `pkgs`.
     let pkgs = synced.packages;
-    let candidates: Vec<Candidate> = pkgs.iter().enumerate().map(|(i, p)| to_candidate(i, p)).collect();
+    let candidates: Vec<Candidate> = pkgs
+        .iter()
+        .enumerate()
+        .map(|(i, p)| to_candidate(i, p))
+        .collect();
 
     let ids: Vec<usize> = if with_deps {
         let installed = installed_provides();
-        let resolved = resolve(packages, &candidates, &installed)
+        let resolved = resolve_sat(packages, &candidates, &installed)
             .map_err(|e| anyhow::anyhow!("dependency resolution failed: {e}"))?;
         resolved.to_install
     } else {
@@ -86,9 +90,16 @@ pub fn resolve_and_fetch(
     let mut jobs: Vec<Job> = Vec::new();
     for &i in &ids {
         let p = &pkgs[i];
-        let base = synced.base_urls.get(&p.repo_id).cloned().unwrap_or_default();
+        let base = synced
+            .base_urls
+            .get(&p.repo_id)
+            .cloned()
+            .unwrap_or_default();
         if base.is_empty() {
-            anyhow::bail!("no base URL known for repo `{}` (run `rum makecache`)", p.repo_id);
+            anyhow::bail!(
+                "no base URL known for repo `{}` (run `rum makecache`)",
+                p.repo_id
+            );
         }
         jobs.push(Job {
             url: join_url(&base, &p.location),
@@ -96,6 +107,7 @@ pub fn resolve_and_fetch(
             checksum: p.checksum.clone(),
             size: p.size,
             nevra: p.nevra(),
+            repo_id: p.repo_id.clone(),
         });
     }
 
@@ -110,7 +122,7 @@ pub fn resolve_and_fetch(
     }
 
     let start = std::time::Instant::now();
-    let failures = download_all(&jobs);
+    let failures = download_all(&jobs, &synced.clients);
     let elapsed = start.elapsed();
 
     if !failures.is_empty() {
@@ -134,26 +146,30 @@ struct Job {
     checksum: rum_repo::Checksum,
     size: u64,
     nevra: String,
+    repo_id: String,
 }
 
-/// Download all jobs across a bounded set of worker threads.
-fn download_all(jobs: &[Job]) -> Vec<String> {
+/// Download all jobs across a bounded set of worker threads, using each repo's
+/// own HTTP client (so mutual-TLS repos present their client certificate).
+fn download_all(jobs: &[Job], clients: &std::collections::HashMap<String, Http>) -> Vec<String> {
     let threads = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4)
         .min(jobs.len().max(1))
         .min(16);
 
+    let default = Http::new();
     let mut failures = Vec::new();
     std::thread::scope(|scope| {
         let chunk_size = jobs.len().div_ceil(threads).max(1);
         let mut handles = Vec::new();
         for chunk in jobs.chunks(chunk_size) {
+            let default = &default;
             handles.push(scope.spawn(move || {
-                let http = Http::new();
                 let mut errs = Vec::new();
                 for job in chunk {
-                    if let Err(e) = download_one(&http, job) {
+                    let http = clients.get(&job.repo_id).unwrap_or(default);
+                    if let Err(e) = download_one(http, job) {
                         errs.push(format!("{}: {e}", job.nevra));
                     }
                 }
@@ -176,7 +192,8 @@ fn download_one(http: &Http, job: &Job) -> anyhow::Result<()> {
     if !job.checksum.verify(&bytes) {
         anyhow::bail!("checksum mismatch");
     }
-    std::fs::write(&job.dest, &bytes).map_err(|e| anyhow::anyhow!("write {}: {e}", job.dest.display()))?;
+    std::fs::write(&job.dest, &bytes)
+        .map_err(|e| anyhow::anyhow!("write {}: {e}", job.dest.display()))?;
     Ok(())
 }
 
@@ -214,14 +231,21 @@ fn best_match(spec: &str, pkgs: &[AvailablePackage]) -> Option<usize> {
         .enumerate()
         .filter(|(_, p)| p.name == spec || p.name_arch() == *spec)
         .max_by(|(_, a), (_, b)| {
-            Evr::new(Some(a.epoch), a.version.clone(), a.release.clone())
-                .compare(&Evr::new(Some(b.epoch), b.version.clone(), b.release.clone()))
+            Evr::new(Some(a.epoch), a.version.clone(), a.release.clone()).compare(&Evr::new(
+                Some(b.epoch),
+                b.version.clone(),
+                b.release.clone(),
+            ))
         })
         .map(|(i, _)| i)
 }
 
 fn join_url(base: &str, href: &str) -> String {
-    format!("{}/{}", base.trim_end_matches('/'), href.trim_start_matches('/'))
+    format!(
+        "{}/{}",
+        base.trim_end_matches('/'),
+        href.trim_start_matches('/')
+    )
 }
 
 fn basename(location: &str) -> &str {

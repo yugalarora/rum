@@ -47,7 +47,10 @@ impl Ini {
                         sections.push(sec);
                     }
                     let name = trimmed[1..end].trim().to_string();
-                    current = Some(Section { name, entries: BTreeMap::new() });
+                    current = Some(Section {
+                        name,
+                        entries: BTreeMap::new(),
+                    });
                     last_key = None;
                     continue;
                 }

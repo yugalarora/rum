@@ -37,10 +37,9 @@ pub fn run(all: bool, enabled_flag: bool, disabled: bool) -> anyhow::Result<()> 
     let status_w = "status".len().max("disabled".len());
 
     println!(
-        "{:<id_w$}  {:<status_w$}  {}",
+        "{:<id_w$}  {:<status_w$}  repo name",
         "repo id",
         "status",
-        "repo name",
         id_w = id_w,
         status_w = status_w,
     );

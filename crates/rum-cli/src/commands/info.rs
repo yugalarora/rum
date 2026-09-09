@@ -18,7 +18,9 @@ pub fn run(packages: &[String]) -> anyhow::Result<()> {
     for pat in packages {
         for p in &installed {
             if (glob::matches(pat, &p.name) || glob::matches(pat, &p.name_arch()))
-                && !matched.iter().any(|m: &&rum_rpm::Package| m.nevra() == p.nevra())
+                && !matched
+                    .iter()
+                    .any(|m: &&rum_rpm::Package| m.nevra() == p.nevra())
             {
                 matched.push(p);
             }
@@ -26,14 +28,20 @@ pub fn run(packages: &[String]) -> anyhow::Result<()> {
     }
 
     if matched.is_empty() {
-        anyhow::bail!("No matching installed packages for: {}", packages.join(", "));
+        anyhow::bail!(
+            "No matching installed packages for: {}",
+            packages.join(", ")
+        );
     }
 
     matched.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.arch.cmp(&b.arch)));
 
     println!("Installed Packages");
     for p in matched {
-        let epoch = p.epoch.map(|e| e.to_string()).unwrap_or_else(|| "(none)".into());
+        let epoch = p
+            .epoch
+            .map(|e| e.to_string())
+            .unwrap_or_else(|| "(none)".into());
         println!("Name        : {}", p.name);
         println!("Epoch       : {epoch}");
         println!("Version     : {}", p.version);

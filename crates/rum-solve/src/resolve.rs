@@ -35,7 +35,10 @@ pub enum ResolveError {
     #[error("no package found matching `{0}`")]
     NotFound(String),
     #[error("unresolved dependency for `{package}`: nothing provides `{requirement}`")]
-    Unsatisfied { package: String, requirement: String },
+    Unsatisfied {
+        package: String,
+        requirement: String,
+    },
 }
 
 /// A provide as a (name, optional version) pair, from installed packages.
@@ -53,7 +56,10 @@ pub fn resolve(
     let mut prov_index: HashMap<&str, Vec<(usize, Option<&Evr>)>> = HashMap::new();
     for (ci, c) in candidates.iter().enumerate() {
         // Implicit self-provide: every package provides its own name = evr.
-        prov_index.entry(c.name.as_str()).or_default().push((ci, Some(&c.evr)));
+        prov_index
+            .entry(c.name.as_str())
+            .or_default()
+            .push((ci, Some(&c.evr)));
         for p in &c.provides {
             prov_index
                 .entry(p.name.as_str())
@@ -65,7 +71,10 @@ pub fn resolve(
     // Index installed provides for fast satisfaction checks.
     let mut inst_index: HashMap<&str, Vec<Option<&Evr>>> = HashMap::new();
     for (name, evr) in installed_provides {
-        inst_index.entry(name.as_str()).or_default().push(evr.as_ref());
+        inst_index
+            .entry(name.as_str())
+            .or_default()
+            .push(evr.as_ref());
     }
 
     let mut selected: Vec<bool> = vec![false; candidates.len()];
@@ -74,7 +83,8 @@ pub fn resolve(
 
     // Seed with the requested packages.
     for spec in requested {
-        let ci = best_for_spec(spec, candidates).ok_or_else(|| ResolveError::NotFound(spec.clone()))?;
+        let ci =
+            best_for_spec(spec, candidates).ok_or_else(|| ResolveError::NotFound(spec.clone()))?;
         if !selected[ci] {
             selected[ci] = true;
             order.push(ci);
@@ -131,14 +141,17 @@ fn best_for_spec(spec: &str, candidates: &[Candidate]) -> Option<usize> {
         .iter()
         .enumerate()
         .filter(|(_, c)| c.name == spec || format!("{}.{}", c.name, c.arch) == *spec)
-        .max_by(|(_, a), (_, b)| a.evr.compare(&b.evr).then_with(|| arch_pref(&a.arch).cmp(&arch_pref(&b.arch))))
+        .max_by(|(_, a), (_, b)| {
+            a.evr
+                .compare(&b.evr)
+                .then_with(|| arch_pref(&a.arch).cmp(&arch_pref(&b.arch)))
+        })
         .map(|(i, _)| i)
 }
 
 fn satisfied_by_installed(req: &Dep, inst: &HashMap<&str, Vec<Option<&Evr>>>) -> bool {
-    inst.get(req.name.as_str()).is_some_and(|provs| {
-        provs.iter().any(|pe| req.satisfied_by(&req.name, *pe))
-    })
+    inst.get(req.name.as_str())
+        .is_some_and(|provs| provs.iter().any(|pe| req.satisfied_by(&req.name, *pe)))
 }
 
 fn satisfied_by_selected(
@@ -222,7 +235,13 @@ mod tests {
         // app -> libb -> libc ; libc requires nothing.
         let cands = vec![
             cand(10, "app", "1.0", &[], &[Dep::unversioned("libb.so")]),
-            cand(20, "libb", "1.0", &["libb.so"], &[Dep::unversioned("libc.so")]),
+            cand(
+                20,
+                "libb",
+                "1.0",
+                &["libb.so"],
+                &[Dep::unversioned("libc.so")],
+            ),
             cand(30, "libc", "1.0", &["libc.so"], &[]),
         ];
         let r = resolve(&["app".into()], &cands, &[]).unwrap();
@@ -243,7 +262,13 @@ mod tests {
 
     #[test]
     fn errors_on_missing_dependency() {
-        let cands = vec![cand(10, "app", "1.0", &[], &[Dep::unversioned("missing.so")])];
+        let cands = vec![cand(
+            10,
+            "app",
+            "1.0",
+            &[],
+            &[Dep::unversioned("missing.so")],
+        )];
         let err = resolve(&["app".into()], &cands, &[]).unwrap_err();
         assert!(matches!(err, ResolveError::Unsatisfied { .. }));
     }

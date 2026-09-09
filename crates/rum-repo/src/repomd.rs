@@ -51,17 +51,20 @@ impl RepoMd {
                     let name = e.local_name().as_ref().to_vec();
                     match name.as_slice() {
                         b"data" => {
-                            let mut p = Partial::default();
-                            p.data_type = attr(&e, b"type");
-                            cur = Some(p);
+                            cur = Some(Partial {
+                                data_type: attr(&e, b"type"),
+                                ..Default::default()
+                            });
                         }
                         b"checksum" => {
                             cksum_ctx = 1;
-                            cksum_kind = attr_opt(&e, b"type").and_then(|s| ChecksumKind::parse(&s));
+                            cksum_kind =
+                                attr_opt(&e, b"type").and_then(|s| ChecksumKind::parse(&s));
                         }
                         b"open-checksum" => {
                             cksum_ctx = 2;
-                            cksum_kind = attr_opt(&e, b"type").and_then(|s| ChecksumKind::parse(&s));
+                            cksum_kind =
+                                attr_opt(&e, b"type").and_then(|s| ChecksumKind::parse(&s));
                         }
                         _ => {}
                     }
@@ -115,7 +118,9 @@ impl RepoMd {
         }
 
         if md.data.is_empty() {
-            return Err(RepoError::Xml("repomd.xml contained no <data> entries".into()));
+            return Err(RepoError::Xml(
+                "repomd.xml contained no <data> entries".into(),
+            ));
         }
         Ok(md)
     }
@@ -151,9 +156,10 @@ fn attr(e: &quick_xml::events::BytesStart, key: &[u8]) -> String {
 }
 
 fn attr_opt(e: &quick_xml::events::BytesStart, key: &[u8]) -> Option<String> {
-    e.attributes().flatten().find(|a| a.key.local_name().as_ref() == key).map(|a| {
-        String::from_utf8_lossy(&a.value).into_owned()
-    })
+    e.attributes()
+        .flatten()
+        .find(|a| a.key.local_name().as_ref() == key)
+        .map(|a| String::from_utf8_lossy(&a.value).into_owned())
 }
 
 #[cfg(test)]

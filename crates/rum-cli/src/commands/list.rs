@@ -9,9 +9,7 @@ pub fn run(what: &str, patterns: &[String]) -> anyhow::Result<()> {
         "installed" => list_installed(patterns),
         "available" => list_available(patterns),
         "all" => list_all(patterns),
-        other => anyhow::bail!(
-            "unknown list type `{other}` (expected: installed, available, all)"
-        ),
+        other => anyhow::bail!("unknown list type `{other}` (expected: installed, available, all)"),
     }
 }
 

@@ -27,7 +27,12 @@ pub fn run(terms: &[String]) -> anyhow::Result<()> {
         anyhow::bail!("No matches for: {}", terms.join(", "));
     }
 
-    let name_w = hits.iter().map(|(na, _)| na.len()).max().unwrap_or(20).max(20);
+    let name_w = hits
+        .iter()
+        .map(|(na, _)| na.len())
+        .max()
+        .unwrap_or(20)
+        .max(20);
     println!("Matched Packages");
     for (na, summary) in &hits {
         let summary = summary.replace('\n', " ");
