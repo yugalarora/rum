@@ -1,0 +1,75 @@
+//! Shared helper: load config and sync all enabled repos into one package list.
+
+use std::time::Instant;
+
+use rum_repo::{AvailablePackage, SyncOptions};
+
+use crate::sys;
+
+/// Result of syncing every enabled repo.
+pub struct Synced {
+    pub packages: Vec<AvailablePackage>,
+    /// Per-repo (id, count, from_cache) for reporting.
+    pub repos: Vec<RepoStat>,
+    pub elapsed: std::time::Duration,
+}
+
+pub struct RepoStat {
+    pub id: String,
+    pub count: usize,
+    pub from_cache: bool,
+    pub error: Option<String>,
+}
+
+/// Load system config and sync all enabled repos in parallel.
+///
+/// `force_refresh` ignores cache freshness. Repos that fail are reported in
+/// `RepoStat.error` rather than aborting the whole operation.
+pub fn sync_enabled(force_refresh: bool) -> anyhow::Result<Synced> {
+    let config = sys::load_config()?;
+
+    let enabled = config.enabled_repos();
+    let opts = SyncOptions {
+        cachedir: sys::effective_cachedir(&config.main.cachedir),
+        force_refresh,
+    };
+
+    let start = Instant::now();
+    let results = rum_repo::sync_all(&enabled, &opts);
+    let elapsed = start.elapsed();
+
+    let mut packages = Vec::new();
+    let mut repos = Vec::new();
+    for (id, res) in results {
+        match res {
+            Ok(md) => {
+                repos.push(RepoStat {
+                    id,
+                    count: md.packages.len(),
+                    from_cache: md.from_cache,
+                    error: None,
+                });
+                packages.extend(md.packages);
+            }
+            Err(e) => {
+                tracing::warn!(repo = %id, "sync failed: {e}");
+                repos.push(RepoStat {
+                    id,
+                    count: 0,
+                    from_cache: false,
+                    error: Some(e.to_string()),
+                });
+            }
+        }
+    }
+
+    // config is loaded and used to drive the sync; not returned yet (install
+    // will need it in a later milestone).
+    let _ = config;
+
+    Ok(Synced {
+        packages,
+        repos,
+        elapsed,
+    })
+}
