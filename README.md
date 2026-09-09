@@ -98,10 +98,15 @@ rum search web server        # search name + summary
 rum provides /usr/bin/tree   # (planned) which package provides a path
 rum check-update             # list available updates (exit 100 if any, like dnf)
 rum download --resolve git   # download a package + its dependency closure
-rum install -y git           # resolve, download, and install
+rum install -y git           # resolve, show transaction, download, and install
 rum remove -y git            # erase
 rum upgrade httpd            # upgrade in place
+rum clean all                # clear cached metadata and packages
 ```
+
+`rum install` is idempotent: installing a package that is already present at
+the latest available version is a no-op ("Nothing to do"), and it shows the
+full transaction before downloading anything.
 
 Global flags: `-y/--assumeyes`, `--assumeno`, `-v/--verbose` (repeatable),
 `RUM_LOG=debug` for tracing.
@@ -135,7 +140,11 @@ on Amazon Linux 2023 (sqlite rpmdb) and RHEL 8 (BerkeleyDB rpmdb).
 Known limitations / roadmap:
 
 - **Weak dependencies** (`Recommends`/`Suggests`) are not yet pulled; `dnf` installs them
-  by default, so rum may install a smaller set for packages that use them.
+  by default (`install_weak_deps=1`), so rum installs a smaller set for packages that use
+  them. rum's **hard**-dependency resolution matches dnf exactly (validated on nginx, git,
+  gcc-c++, and others); the difference on large packages (e.g. a headless JDK pulling
+  fonts) is entirely these weak dependencies. Rich/boolean deps like
+  `(mysql-selinux if selinux-policy-targeted)` are currently skipped for the same reason.
 - **Transaction commit** currently shells out to `rpm` (librpm); a native `rpmtsRun` FFI
   path is planned.
 - **Red Hat RHUI** repos (RHEL-on-AWS): region substitution and TLS client-certificate

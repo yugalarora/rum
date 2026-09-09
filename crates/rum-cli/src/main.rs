@@ -134,6 +134,7 @@ fn main() -> anyhow::Result<()> {
             // `upgrade <pkgs>` is install semantics (rpm -U upgrades in place).
             commands::install::run(&packages, assume_yes)
         }
+        Command::Clean { what } => commands::clean::run(&what),
         other => {
             // Every other command is a recognized dnf verb we have not wired
             // up yet. Be explicit rather than silently doing nothing.

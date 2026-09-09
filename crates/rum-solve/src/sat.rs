@@ -52,6 +52,15 @@ struct RpmProvider {
     pkg_evr: HashMap<SolvableId, Evr>,
 }
 
+/// Requirements rum does not resolve against repo packages:
+///   * `rpmlib(...)` — rpm feature flags, satisfied by rpm itself.
+///   * rich/boolean deps like `(mysql-selinux if selinux-policy-targeted)` —
+///     not yet parsed; skipped so they don't make the set unsolvable (rum may
+///     therefore not pull a conditional dependency, like weak deps).
+fn is_ignorable_dep(name: &str) -> bool {
+    name.starts_with("rpmlib(") || name.starts_with('(')
+}
+
 fn version_set(pool: &Pool<Ranges<Evr>>, cap: NameId, dep: &Dep) -> VersionSetId {
     let ranges = match (&dep.evr, dep.flag) {
         (None, _) | (_, DepFlag::Any) => Ranges::full(),
@@ -92,7 +101,7 @@ fn build(
         let reqs: Vec<ConditionalRequirement> = c
             .requires
             .iter()
-            .filter(|r| !r.name.starts_with("rpmlib("))
+            .filter(|r| !is_ignorable_dep(&r.name))
             .map(|r| {
                 let cap = pool.intern_package_name(r.name.clone());
                 ConditionalRequirement::from(version_set(&pool, cap, r))
@@ -263,7 +272,7 @@ pub fn resolve_sat(
     let mut required: HashSet<String> = HashSet::new();
     for c in candidates {
         for r in &c.requires {
-            if !r.name.starts_with("rpmlib(") {
+            if !is_ignorable_dep(&r.name) {
                 required.insert(r.name.clone());
             }
         }

@@ -103,8 +103,9 @@ pub fn resolve(
         let pkg_label = candidates[ci].name.clone();
 
         for req in &reqs {
-            // rpmlib(...) feature requirements are satisfied by rpm itself.
-            if req.name.starts_with("rpmlib(") {
+            // Skip rpmlib(...) feature requirements (satisfied by rpm itself)
+            // and rich/boolean deps like `(a if b)` (not parsed yet).
+            if req.name.starts_with("rpmlib(") || req.name.starts_with('(') {
                 continue;
             }
             if satisfied_by_installed(req, &inst_index) {

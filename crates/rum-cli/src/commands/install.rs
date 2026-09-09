@@ -19,30 +19,29 @@ pub fn run(packages: &[String], assume_yes: bool) -> anyhow::Result<()> {
         anyhow::bail!("`rum install` needs at least one package name");
     }
 
-    // Download into rum's package cache.
-    let cachedir = sys::effective_cachedir("/var/cache/rum");
-    let pkgdir = cachedir.join("packages");
-
-    let fetched = download::resolve_and_fetch(packages, true, &pkgdir, false)?;
-    if fetched.files.is_empty() {
+    // Resolve first (no download yet), so we can show the transaction and
+    // confirm before fetching anything — matching dnf's order.
+    let resolution = download::resolve_packages(packages, true)?;
+    if resolution.is_empty() {
         println!("Nothing to do.");
         return Ok(());
     }
 
-    // Show the transaction.
-    println!("\nInstalling {} package(s):", fetched.nevras.len());
-    let mut nevras: Vec<&String> = fetched.nevras.iter().collect();
-    nevras.sort();
-    for n in nevras {
+    let nevras = resolution.nevras();
+    println!("\nInstalling {} package(s):", nevras.len());
+    for n in &nevras {
         println!("  {n}");
     }
-    println!("\nTotal download size: {}", human(fetched.total_bytes));
+    println!("\nTotal download size: {}", human(resolution.total_bytes()));
 
     if !assume_yes && !confirm() {
         println!("Operation cancelled.");
         return Ok(());
     }
 
+    // Download into rum's package cache, then commit.
+    let pkgdir = sys::effective_cachedir("/var/cache/rum").join("packages");
+    let fetched = download::fetch(&resolution, &pkgdir)?;
     commit_install(&fetched.files)
 }
 

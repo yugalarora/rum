@@ -14,7 +14,18 @@ pub fn run(packages: &[String], with_deps: bool, destdir: &Path) -> anyhow::Resu
     if packages.is_empty() {
         anyhow::bail!("`rum download` needs at least one package name");
     }
-    let fetched = resolve_and_fetch(packages, with_deps, destdir, true)?;
+    let resolution = resolve_packages(packages, with_deps)?;
+    if resolution.is_empty() {
+        println!("Nothing to download.");
+        return Ok(());
+    }
+    println!(
+        "Downloading {} package(s), {} total, to {}",
+        resolution.ids.len(),
+        human(resolution.total_bytes()),
+        destdir.display()
+    );
+    let fetched = fetch(&resolution, destdir)?;
     println!(
         "\nDownloaded {} package(s), {} in {:.2}s.",
         fetched.files.len(),
@@ -24,25 +35,44 @@ pub fn run(packages: &[String], with_deps: bool, destdir: &Path) -> anyhow::Resu
     Ok(())
 }
 
-/// The result of resolving and downloading a package set.
+/// A resolved transaction: which packages to act on, plus the repo data needed
+/// to fetch them. Produced by [`resolve_packages`] *without* downloading, so
+/// callers can show the transaction and confirm before any bytes move.
+pub struct Resolution {
+    synced: repo_sync::Synced,
+    /// Indices into `synced.packages`, in resolved order.
+    pub ids: Vec<usize>,
+}
+
+impl Resolution {
+    pub fn is_empty(&self) -> bool {
+        self.ids.is_empty()
+    }
+    /// NEVRAs of the resolved packages, sorted.
+    pub fn nevras(&self) -> Vec<String> {
+        let mut v: Vec<String> = self
+            .ids
+            .iter()
+            .map(|&i| self.synced.packages[i].nevra())
+            .collect();
+        v.sort();
+        v
+    }
+    pub fn total_bytes(&self) -> u64 {
+        self.ids.iter().map(|&i| self.synced.packages[i].size).sum()
+    }
+}
+
+/// The result of downloading a resolved package set.
 pub struct Fetched {
-    /// On-disk paths of the downloaded RPMs, in resolved order.
     pub files: Vec<PathBuf>,
-    /// NEVRAs corresponding to `files`.
-    pub nevras: Vec<String>,
     pub total_bytes: u64,
     pub elapsed: std::time::Duration,
 }
 
-/// Resolve `packages` (optionally with deps), download the RPMs to `destdir`
-/// verifying checksums, and return their paths. Shared by `download` and
-/// `install`.
-pub fn resolve_and_fetch(
-    packages: &[String],
-    with_deps: bool,
-    destdir: &Path,
-    announce: bool,
-) -> anyhow::Result<Fetched> {
+/// Resolve `packages` (optionally with their dependency closure) against the
+/// enabled repos. Does NOT download anything.
+pub fn resolve_packages(packages: &[String], with_deps: bool) -> anyhow::Result<Resolution> {
     let synced = repo_sync::sync_enabled(false)?;
     for r in &synced.repos {
         if let Some(e) = &r.error {
@@ -50,9 +80,8 @@ pub fn resolve_and_fetch(
         }
     }
 
-    // Build the candidate universe once. `id` indexes back into `pkgs`.
-    let pkgs = synced.packages;
-    let candidates: Vec<Candidate> = pkgs
+    let candidates: Vec<Candidate> = synced
+        .packages
         .iter()
         .enumerate()
         .map(|(i, p)| to_candidate(i, p))
@@ -60,13 +89,13 @@ pub fn resolve_and_fetch(
 
     let ids: Vec<usize> = if with_deps {
         let installed = installed_provides();
-        let resolved = resolve_sat(packages, &candidates, &installed)
-            .map_err(|e| anyhow::anyhow!("dependency resolution failed: {e}"))?;
-        resolved.to_install
+        resolve_sat(packages, &candidates, &installed)
+            .map_err(|e| anyhow::anyhow!("dependency resolution failed: {e}"))?
+            .to_install
     } else {
         let mut ids = Vec::new();
         for spec in packages {
-            match best_match(spec, &pkgs) {
+            match best_match(spec, &synced.packages) {
                 Some(i) if !ids.contains(&i) => ids.push(i),
                 Some(_) => {}
                 None => anyhow::bail!("no package found matching `{spec}`"),
@@ -75,22 +104,19 @@ pub fn resolve_and_fetch(
         ids
     };
 
-    if ids.is_empty() {
-        return Ok(Fetched {
-            files: Vec::new(),
-            nevras: Vec::new(),
-            total_bytes: 0,
-            elapsed: std::time::Duration::ZERO,
-        });
-    }
+    Ok(Resolution { synced, ids })
+}
 
+/// Download a resolved set to `destdir`, verifying checksums.
+pub fn fetch(resolution: &Resolution, destdir: &Path) -> anyhow::Result<Fetched> {
     std::fs::create_dir_all(destdir)
         .map_err(|e| anyhow::anyhow!("cannot create {}: {e}", destdir.display()))?;
 
     let mut jobs: Vec<Job> = Vec::new();
-    for &i in &ids {
-        let p = &pkgs[i];
-        let base = synced
+    for &i in &resolution.ids {
+        let p = &resolution.synced.packages[i];
+        let base = resolution
+            .synced
             .base_urls
             .get(&p.repo_id)
             .cloned()
@@ -105,24 +131,14 @@ pub fn resolve_and_fetch(
             url: join_url(&base, &p.location),
             dest: destdir.join(basename(&p.location)),
             checksum: p.checksum.clone(),
-            size: p.size,
             nevra: p.nevra(),
             repo_id: p.repo_id.clone(),
         });
     }
 
-    let total_bytes: u64 = jobs.iter().map(|j| j.size).sum();
-    if announce {
-        println!(
-            "Downloading {} package(s), {} total, to {}",
-            jobs.len(),
-            human(total_bytes),
-            destdir.display()
-        );
-    }
-
+    let total_bytes = resolution.total_bytes();
     let start = std::time::Instant::now();
-    let failures = download_all(&jobs, &synced.clients);
+    let failures = download_all(&jobs, &resolution.synced.clients);
     let elapsed = start.elapsed();
 
     if !failures.is_empty() {
@@ -134,7 +150,6 @@ pub fn resolve_and_fetch(
 
     Ok(Fetched {
         files: jobs.iter().map(|j| j.dest.clone()).collect(),
-        nevras: jobs.iter().map(|j| j.nevra.clone()).collect(),
         total_bytes,
         elapsed,
     })
@@ -144,7 +159,6 @@ struct Job {
     url: String,
     dest: PathBuf,
     checksum: rum_repo::Checksum,
-    size: u64,
     nevra: String,
     repo_id: String,
 }
