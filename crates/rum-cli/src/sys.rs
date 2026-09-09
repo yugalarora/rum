@@ -56,7 +56,7 @@ pub fn effective_cachedir(configured: &str) -> PathBuf {
 }
 
 #[cfg(unix)]
-fn is_root() -> bool {
+pub fn is_root() -> bool {
     extern "C" {
         fn geteuid() -> u32;
     }
@@ -65,6 +65,18 @@ fn is_root() -> bool {
 }
 
 #[cfg(not(unix))]
-fn is_root() -> bool {
+pub fn is_root() -> bool {
     false
+}
+
+/// Build a command that runs `prog`, escalating via sudo when not already root
+/// (state-changing rpm operations need write access to the rpmdb).
+pub fn privileged(prog: &str) -> std::process::Command {
+    if is_root() {
+        std::process::Command::new(prog)
+    } else {
+        let mut c = std::process::Command::new("sudo");
+        c.arg(prog);
+        c
+    }
 }

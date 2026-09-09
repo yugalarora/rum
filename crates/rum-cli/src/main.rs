@@ -109,6 +109,9 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     init_tracing(cli.verbose);
 
+    // --assumeno overrides --assumeyes for state-changing operations.
+    let assume_yes = cli.assume_yes && !cli.assume_no;
+
     match cli.command {
         Command::Repolist {
             all,
@@ -125,6 +128,12 @@ fn main() -> anyhow::Result<()> {
             resolve,
             destdir,
         } => commands::download::run(&packages, resolve, std::path::Path::new(&destdir)),
+        Command::Install { packages } => commands::install::run(&packages, assume_yes),
+        Command::Remove { packages } => commands::remove::run(&packages, assume_yes),
+        Command::Upgrade { packages } if !packages.is_empty() => {
+            // `upgrade <pkgs>` is install semantics (rpm -U upgrades in place).
+            commands::install::run(&packages, assume_yes)
+        }
         other => {
             // Every other command is a recognized dnf verb we have not wired
             // up yet. Be explicit rather than silently doing nothing.

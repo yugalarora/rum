@@ -3,14 +3,28 @@
 pub mod check_update;
 pub mod download;
 pub mod info;
+pub mod install;
 pub mod list;
 pub mod makecache;
 pub mod pkgindex;
+pub mod remove;
 pub mod repo_sync;
 pub mod repolist;
 pub mod search;
 
 use crate::Command;
+
+/// Prompt for confirmation (dnf-style `Is this ok [y/N]:`). Default No.
+pub fn confirm() -> bool {
+    use std::io::Write;
+    print!("Is this ok [y/N]: ");
+    std::io::stdout().flush().ok();
+    let mut line = String::new();
+    if std::io::stdin().read_line(&mut line).is_err() {
+        return false;
+    }
+    matches!(line.trim().to_lowercase().as_str(), "y" | "yes")
+}
 
 /// Uniform "recognized but not implemented yet" response for planned verbs.
 ///

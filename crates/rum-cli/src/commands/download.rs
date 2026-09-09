@@ -14,7 +14,35 @@ pub fn run(packages: &[String], with_deps: bool, destdir: &Path) -> anyhow::Resu
     if packages.is_empty() {
         anyhow::bail!("`rum download` needs at least one package name");
     }
+    let fetched = resolve_and_fetch(packages, with_deps, destdir, true)?;
+    println!(
+        "\nDownloaded {} package(s), {} in {:.2}s.",
+        fetched.files.len(),
+        human(fetched.total_bytes),
+        fetched.elapsed.as_secs_f64()
+    );
+    Ok(())
+}
 
+/// The result of resolving and downloading a package set.
+pub struct Fetched {
+    /// On-disk paths of the downloaded RPMs, in resolved order.
+    pub files: Vec<PathBuf>,
+    /// NEVRAs corresponding to `files`.
+    pub nevras: Vec<String>,
+    pub total_bytes: u64,
+    pub elapsed: std::time::Duration,
+}
+
+/// Resolve `packages` (optionally with deps), download the RPMs to `destdir`
+/// verifying checksums, and return their paths. Shared by `download` and
+/// `install`.
+pub fn resolve_and_fetch(
+    packages: &[String],
+    with_deps: bool,
+    destdir: &Path,
+    announce: bool,
+) -> anyhow::Result<Fetched> {
     let synced = repo_sync::sync_enabled(false)?;
     for r in &synced.repos {
         if let Some(e) = &r.error {
@@ -26,7 +54,6 @@ pub fn run(packages: &[String], with_deps: bool, destdir: &Path) -> anyhow::Resu
     let pkgs = synced.packages;
     let candidates: Vec<Candidate> = pkgs.iter().enumerate().map(|(i, p)| to_candidate(i, p)).collect();
 
-    // Which package indices to download.
     let ids: Vec<usize> = if with_deps {
         let installed = installed_provides();
         let resolved = resolve(packages, &candidates, &installed)
@@ -45,14 +72,17 @@ pub fn run(packages: &[String], with_deps: bool, destdir: &Path) -> anyhow::Resu
     };
 
     if ids.is_empty() {
-        println!("Nothing to download.");
-        return Ok(());
+        return Ok(Fetched {
+            files: Vec::new(),
+            nevras: Vec::new(),
+            total_bytes: 0,
+            elapsed: std::time::Duration::ZERO,
+        });
     }
 
     std::fs::create_dir_all(destdir)
         .map_err(|e| anyhow::anyhow!("cannot create {}: {e}", destdir.display()))?;
 
-    // Resolve each package's absolute URL up front.
     let mut jobs: Vec<Job> = Vec::new();
     for &i in &ids {
         let p = &pkgs[i];
@@ -70,31 +100,32 @@ pub fn run(packages: &[String], with_deps: bool, destdir: &Path) -> anyhow::Resu
     }
 
     let total_bytes: u64 = jobs.iter().map(|j| j.size).sum();
-    println!(
-        "Downloading {} package(s), {} total, to {}",
-        jobs.len(),
-        human(total_bytes),
-        destdir.display()
-    );
+    if announce {
+        println!(
+            "Downloading {} package(s), {} total, to {}",
+            jobs.len(),
+            human(total_bytes),
+            destdir.display()
+        );
+    }
 
     let start = std::time::Instant::now();
     let failures = download_all(&jobs);
     let elapsed = start.elapsed();
 
-    for f in &failures {
-        eprintln!("FAILED {f}");
-    }
-    println!(
-        "\nDownloaded {}/{} package(s), {} in {:.2}s.",
-        jobs.len() - failures.len(),
-        jobs.len(),
-        human(total_bytes),
-        elapsed.as_secs_f64()
-    );
     if !failures.is_empty() {
+        for f in &failures {
+            eprintln!("FAILED {f}");
+        }
         anyhow::bail!("{} package(s) failed to download", failures.len());
     }
-    Ok(())
+
+    Ok(Fetched {
+        files: jobs.iter().map(|j| j.dest.clone()).collect(),
+        nevras: jobs.iter().map(|j| j.nevra.clone()).collect(),
+        total_bytes,
+        elapsed,
+    })
 }
 
 struct Job {
