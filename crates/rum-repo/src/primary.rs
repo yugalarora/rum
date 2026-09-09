@@ -33,6 +33,9 @@ pub struct AvailablePackage {
     pub provides: Vec<Dep>,
     /// Capabilities this package requires (from `<format><rpm:requires>`).
     pub requires: Vec<Dep>,
+    /// Weak dependencies (from `<format><rpm:recommends>`); installed by
+    /// default when satisfiable, matching dnf's `install_weak_deps=1`.
+    pub recommends: Vec<Dep>,
     /// File paths this package advertises in primary (satisfy file deps).
     pub files: Vec<String>,
 }
@@ -96,8 +99,9 @@ pub fn parse(xml: &[u8], repo_id: &str) -> Result<Vec<AvailablePackage>, RepoErr
                                 b"size" => b.read_size(&e),
                                 b"provides" => dep_ctx = DepCtx::Provides,
                                 b"requires" => dep_ctx = DepCtx::Requires,
-                                b"conflicts" | b"obsoletes" | b"suggests" | b"recommends"
-                                | b"enhances" | b"supplements" => dep_ctx = DepCtx::None,
+                                b"recommends" => dep_ctx = DepCtx::Recommends,
+                                b"conflicts" | b"obsoletes" | b"suggests" | b"enhances"
+                                | b"supplements" => dep_ctx = DepCtx::None,
                                 b"file" => field = Field::File,
                                 b"entry" => push_entry(b, dep_ctx, &e),
                                 _ => field = Field::None,
@@ -153,7 +157,7 @@ pub fn parse(xml: &[u8], repo_id: &str) -> Result<Vec<AvailablePackage>, RepoErr
                     depth_in_package -= 1;
                     if matches!(
                         name.as_slice(),
-                        b"provides" | b"requires" | b"conflicts" | b"obsoletes"
+                        b"provides" | b"requires" | b"recommends" | b"conflicts" | b"obsoletes"
                     ) {
                         dep_ctx = DepCtx::None;
                     }
@@ -186,6 +190,7 @@ enum DepCtx {
     None,
     Provides,
     Requires,
+    Recommends,
 }
 
 /// Push an `<rpm:entry>` into the provides/requires list per the active context.
@@ -197,6 +202,7 @@ fn push_entry(b: &mut Builder, ctx: DepCtx, e: &quick_xml::events::BytesStart) {
         match ctx {
             DepCtx::Provides => b.provides.push(d),
             DepCtx::Requires => b.requires.push(d),
+            DepCtx::Recommends => b.recommends.push(d),
             DepCtx::None => {}
         }
     }
@@ -230,6 +236,7 @@ struct Builder {
     pending_cksum_kind: Option<ChecksumKind>,
     provides: Vec<Dep>,
     requires: Vec<Dep>,
+    recommends: Vec<Dep>,
     files: Vec<String>,
 }
 
@@ -263,6 +270,7 @@ impl Builder {
             repo_id: repo_id.to_string(),
             provides: self.provides,
             requires: self.requires,
+            recommends: self.recommends,
             files: self.files,
         })
     }
@@ -305,6 +313,9 @@ mod tests {
                 <rpm:entry name="glibc" flags="GE" epoch="0" ver="2.34"/>
                 <rpm:entry name="/bin/sh"/>
               </rpm:requires>
+              <rpm:recommends>
+                <rpm:entry name="bash-completion"/>
+              </rpm:recommends>
               <file>/usr/bin/bash</file>
               <file type="dir">/etc/bash</file>
               <checksum>should-not-be-picked</checksum>
@@ -341,6 +352,8 @@ mod tests {
         assert_eq!(bash.requires[0].name, "glibc");
         assert_eq!(bash.requires[0].flag, rum_solve::DepFlag::Ge);
         assert!(bash.requires[1].evr.is_none()); // /bin/sh unversioned
+        assert_eq!(bash.recommends.len(), 1);
+        assert_eq!(bash.recommends[0].name, "bash-completion");
         assert_eq!(bash.files, vec!["/usr/bin/bash", "/etc/bash"]);
 
         let zlib = &pkgs[1];

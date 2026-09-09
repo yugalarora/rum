@@ -86,6 +86,8 @@ fn build(
     candidates: &[Candidate],
     installed_provides: &[(String, Option<Evr>)],
     required: &HashSet<String>,
+    include_recommends: bool,
+    providable: &HashSet<String>,
 ) -> RpmProvider {
     let pool = Pool::<Ranges<Evr>>::new();
     let mut providers: HashMap<NameId, Vec<SolvableId>> = HashMap::new();
@@ -98,9 +100,19 @@ fn build(
         // Build the package's requirements once; every provider solvable for
         // this package shares them, so selecting the package via *any*
         // capability pulls its dependencies.
+        // Hard requires, plus (when weak deps are on) the Recommends whose
+        // capability is providable — installed as if required, matching dnf's
+        // default. Unsatisfiable recommends are dropped here so they never make
+        // the solve fail.
+        let weak = include_recommends
+            .then(|| c.recommends.iter())
+            .into_iter()
+            .flatten()
+            .filter(|r| providable.contains(&r.name));
         let reqs: Vec<ConditionalRequirement> = c
             .requires
             .iter()
+            .chain(weak)
             .filter(|r| !is_ignorable_dep(&r.name))
             .map(|r| {
                 let cap = pool.intern_package_name(r.name.clone());
@@ -267,8 +279,52 @@ pub fn resolve_sat(
         }
     }
 
-    // The set of capabilities we must materialize: everything required by any
-    // candidate, plus the requested package names themselves.
+    // Every capability that anything can provide (package names + provides +
+    // files + installed). A Recommends is only pulled if its capability is in
+    // here — otherwise it's silently dropped (matching dnf).
+    let mut providable: HashSet<String> = HashSet::new();
+    for c in candidates {
+        providable.insert(c.name.clone());
+        for p in &c.provides {
+            providable.insert(p.name.clone());
+        }
+    }
+    for (name, _) in installed_provides {
+        providable.insert(name.clone());
+    }
+
+    // Try with weak dependencies (dnf's default); if that makes the set
+    // unsolvable, retry hard-only so weak deps never cause a failure.
+    match attempt(
+        requested,
+        &requested_names,
+        candidates,
+        installed_provides,
+        &providable,
+        true,
+    ) {
+        Err(ResolveError::Unsatisfied { .. }) => attempt(
+            requested,
+            &requested_names,
+            candidates,
+            installed_provides,
+            &providable,
+            false,
+        ),
+        other => other,
+    }
+}
+
+fn attempt(
+    requested: &[String],
+    requested_names: &[String],
+    candidates: &[Candidate],
+    installed_provides: &[(String, Option<Evr>)],
+    providable: &HashSet<String>,
+    include_recommends: bool,
+) -> Result<Resolved, ResolveError> {
+    // Capabilities to materialize: everything hard-required, the requested
+    // names, and (when on) the satisfiable Recommends.
     let mut required: HashSet<String> = HashSet::new();
     for c in candidates {
         for r in &c.requires {
@@ -276,16 +332,29 @@ pub fn resolve_sat(
                 required.insert(r.name.clone());
             }
         }
+        if include_recommends {
+            for r in &c.recommends {
+                if !is_ignorable_dep(&r.name) && providable.contains(&r.name) {
+                    required.insert(r.name.clone());
+                }
+            }
+        }
     }
-    for n in &requested_names {
+    for n in requested_names {
         required.insert(n.clone());
     }
 
-    let provider = build(candidates, installed_provides, &required);
+    let provider = build(
+        candidates,
+        installed_provides,
+        &required,
+        include_recommends,
+        providable,
+    );
 
     // Root requirements: each requested package, at any version.
     let mut root = Vec::new();
-    for name in &requested_names {
+    for name in requested_names {
         let cap = provider.pool.intern_package_name(name.clone());
         let vs = provider.pool.intern_version_set(cap, Ranges::full());
         root.push(ConditionalRequirement::from(vs));
@@ -339,6 +408,7 @@ mod tests {
             evr: Evr::new(Some(0), ver, "1"),
             provides: provides.iter().map(|p| Dep::unversioned(*p)).collect(),
             requires: requires.to_vec(),
+            recommends: Vec::new(),
         }
     }
 

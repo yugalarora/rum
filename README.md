@@ -139,12 +139,14 @@ on Amazon Linux 2023 (sqlite rpmdb) and RHEL 8 (BerkeleyDB rpmdb).
 
 Known limitations / roadmap:
 
-- **Weak dependencies** (`Recommends`/`Suggests`) are not yet pulled; `dnf` installs them
-  by default (`install_weak_deps=1`), so rum installs a smaller set for packages that use
-  them. rum's **hard**-dependency resolution matches dnf exactly (validated on nginx, git,
-  gcc-c++, and others); the difference on large packages (e.g. a headless JDK pulling
-  fonts) is entirely these weak dependencies. Rich/boolean deps like
-  `(mysql-selinux if selinux-policy-targeted)` are currently skipped for the same reason.
+- **Weak dependencies:** `Recommends` are installed by default (matching dnf's
+  `install_weak_deps=1`) — pulled best-effort, so an unsatisfiable one is dropped rather
+  than failing the transaction. `Suggests` are not installed (dnf doesn't either). rum's
+  resolved set matches dnf exactly on validated closures (nginx, git, gcc-c++, and a full
+  headless-JDK tree at 27 packages).
+- **Rich/boolean dependencies** like `(mysql-selinux if selinux-policy-targeted)` are not
+  yet parsed and are skipped, so rum may miss a conditional dependency dnf would pull
+  (e.g. `mysql-selinux` for mariadb when SELinux is enabled).
 - **Transaction commit** currently shells out to `rpm` (librpm); a native `rpmtsRun` FFI
   path is planned.
 - **Red Hat RHUI** repos (RHEL-on-AWS): region substitution and TLS client-certificate

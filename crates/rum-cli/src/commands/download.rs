@@ -225,6 +225,7 @@ fn to_candidate(id: usize, p: &AvailablePackage) -> Candidate {
         evr: Evr::new(Some(p.epoch), p.version.clone(), p.release.clone()),
         provides,
         requires: p.requires.clone(),
+        recommends: p.recommends.clone(),
     }
 }
 
