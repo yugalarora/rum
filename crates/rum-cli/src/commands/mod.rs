@@ -1,6 +1,7 @@
 //! Command implementations.
 
 pub mod check_update;
+pub mod clean;
 pub mod download;
 pub mod info;
 pub mod install;

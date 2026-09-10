@@ -22,6 +22,8 @@ pub struct Candidate {
     pub evr: Evr,
     pub provides: Vec<Dep>,
     pub requires: Vec<Dep>,
+    /// Weak dependencies (Recommends): pulled best-effort when satisfiable.
+    pub recommends: Vec<Dep>,
 }
 
 /// The outcome of a resolve: the candidate ids to install, in a stable order.
@@ -103,8 +105,9 @@ pub fn resolve(
         let pkg_label = candidates[ci].name.clone();
 
         for req in &reqs {
-            // rpmlib(...) feature requirements are satisfied by rpm itself.
-            if req.name.starts_with("rpmlib(") {
+            // Skip rpmlib(...) feature requirements (satisfied by rpm itself)
+            // and rich/boolean deps like `(a if b)` (not parsed yet).
+            if req.name.starts_with("rpmlib(") || req.name.starts_with('(') {
                 continue;
             }
             if satisfied_by_installed(req, &inst_index) {
@@ -127,6 +130,29 @@ pub fn resolve(
                         package: pkg_label,
                         requirement: format_req(req),
                     });
+                }
+            }
+        }
+
+        // Weak dependencies (Recommends): pull best-effort — install a provider
+        // if one exists, but never fail the resolve if none does. Matches dnf's
+        // default install_weak_deps=1. Recommended packages are enqueued, so
+        // their own hard deps and recommends are pulled transitively.
+        let recs = candidates[ci].recommends.clone();
+        for rec in &recs {
+            if rec.name.starts_with("rpmlib(") || rec.name.starts_with('(') {
+                continue;
+            }
+            if satisfied_by_installed(rec, &inst_index)
+                || satisfied_by_selected(rec, &prov_index, &selected)
+            {
+                continue;
+            }
+            if let Some(pi) = best_provider(rec, &prov_index, candidates) {
+                if !selected[pi] {
+                    selected[pi] = true;
+                    order.push(pi);
+                    queue.push(pi);
                 }
             }
         }
@@ -227,6 +253,7 @@ mod tests {
             evr: Evr::new(Some(0), ver, "1"),
             provides: provides.iter().map(|p| Dep::unversioned(*p)).collect(),
             requires: requires.to_vec(),
+            recommends: Vec::new(),
         }
     }
 
@@ -274,6 +301,18 @@ mod tests {
     }
 
     #[test]
+    fn pulls_satisfiable_recommends_skips_missing() {
+        let mut app = cand(10, "app", "1.0", &[], &[]);
+        app.recommends = vec![Dep::unversioned("plugin"), Dep::unversioned("ghost")];
+        let cands = vec![app, cand(20, "plugin", "1.0", &["plugin"], &[])];
+        let r = resolve(&["app".into()], &cands, &[]).unwrap().to_install;
+        assert!(r.contains(&0), "app selected");
+        assert!(r.contains(&1), "satisfiable recommend `plugin` pulled");
+        // `ghost` has no provider -> silently skipped; resolve still succeeds.
+        assert_eq!(r.len(), 2);
+    }
+
+    #[test]
     fn picks_newest_provider() {
         let cands = vec![
             cand(10, "app", "1.0", &[], &[Dep::unversioned("cap")]),
@@ -299,6 +338,7 @@ mod tests {
                     flag: DepFlag::Ge,
                     evr: Some(Evr::new(Some(0), "2.34", "")),
                 }],
+                recommends: Vec::new(),
             },
             cand(2, "glibc", "2.40", &[], &[]),
         ];

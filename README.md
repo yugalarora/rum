@@ -98,10 +98,15 @@ rum search web server        # search name + summary
 rum provides /usr/bin/tree   # (planned) which package provides a path
 rum check-update             # list available updates (exit 100 if any, like dnf)
 rum download --resolve git   # download a package + its dependency closure
-rum install -y git           # resolve, download, and install
+rum install -y git           # resolve, show transaction, download, and install
 rum remove -y git            # erase
 rum upgrade httpd            # upgrade in place
+rum clean all                # clear cached metadata and packages
 ```
+
+`rum install` is idempotent: installing a package that is already present at
+the latest available version is a no-op ("Nothing to do"), and it shows the
+full transaction before downloading anything.
 
 Global flags: `-y/--assumeyes`, `--assumeno`, `-v/--verbose` (repeatable),
 `RUM_LOG=debug` for tracing.
@@ -134,8 +139,14 @@ on Amazon Linux 2023 (sqlite rpmdb) and RHEL 8 (BerkeleyDB rpmdb).
 
 Known limitations / roadmap:
 
-- **Weak dependencies** (`Recommends`/`Suggests`) are not yet pulled; `dnf` installs them
-  by default, so rum may install a smaller set for packages that use them.
+- **Weak dependencies:** `Recommends` are installed by default (matching dnf's
+  `install_weak_deps=1`) — pulled best-effort, so an unsatisfiable one is dropped rather
+  than failing the transaction. `Suggests` are not installed (dnf doesn't either). rum's
+  resolved set matches dnf exactly on validated closures (nginx, git, gcc-c++, and a full
+  headless-JDK tree at 27 packages).
+- **Rich/boolean dependencies** like `(mysql-selinux if selinux-policy-targeted)` are not
+  yet parsed and are skipped, so rum may miss a conditional dependency dnf would pull
+  (e.g. `mysql-selinux` for mariadb when SELinux is enabled).
 - **Transaction commit** currently shells out to `rpm` (librpm); a native `rpmtsRun` FFI
   path is planned.
 - **Red Hat RHUI** repos (RHEL-on-AWS): region substitution and TLS client-certificate

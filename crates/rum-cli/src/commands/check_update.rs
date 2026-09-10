@@ -14,7 +14,7 @@ pub fn run(patterns: &[String]) -> anyhow::Result<()> {
     }
 
     let installed = pkgindex::installed_best();
-    let available = pkgindex::available_best(synced.packages);
+    let available = pkgindex::available_best(synced.metas());
 
     // An update exists where the best available EVR strictly exceeds the best
     // installed EVR for the same name.arch.
@@ -24,7 +24,7 @@ pub fn run(patterns: &[String]) -> anyhow::Result<()> {
             continue;
         }
         if let Some(avail) = available.get(key) {
-            if pkgindex::available_evr(avail) > *inst_evr {
+            if avail.evr_cmp() > *inst_evr {
                 updates.push((key, avail.evr(), &avail.repo_id));
             }
         }

@@ -14,7 +14,9 @@
 
 mod checksum;
 mod decompress;
+mod filelists;
 mod http;
+mod interned;
 mod primary;
 mod repomd;
 
@@ -23,6 +25,7 @@ use std::time::{Duration, SystemTime};
 
 pub use checksum::{Checksum, ChecksumKind};
 pub use http::{detect_aws_region, Http};
+pub use interned::PkgView;
 pub use primary::AvailablePackage;
 pub use repomd::{RepoMd, RepoMdData};
 
@@ -58,16 +61,95 @@ pub enum RepoError {
     },
 }
 
+use interned::ArchivedStore;
+
+/// Backing store for a repo's rkyv cache bytes: an mmap of `primary.rkyv` on the
+/// warm path (page-aligned, never fully read into the heap — important on tiny
+/// hosts) or the freshly-serialized buffer on a refresh.
+enum MetaBytes {
+    Mapped(memmap2::Mmap),
+    Owned(rkyv::util::AlignedVec),
+}
+
+impl std::ops::Deref for MetaBytes {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        match self {
+            MetaBytes::Mapped(m) => &m[..],
+            MetaBytes::Owned(v) => v.as_slice(),
+        }
+    }
+}
+
 /// The parsed metadata for one repository after a sync.
-#[derive(Debug)]
+///
+/// Held as the rkyv-archived interned [`interned::Store`] (mmap or owned bytes).
+/// Query commands read `&str` views zero-copy via [`Self::views`] (no
+/// per-package allocation); the resolve/download path materializes owned
+/// packages via [`Self::to_owned_packages`].
 pub struct RepoMetadata {
     pub repo_id: String,
-    pub packages: Vec<AvailablePackage>,
+    bytes: MetaBytes,
+    len: usize,
     /// True if served from the local cache without hitting the network.
     pub from_cache: bool,
     /// The base URL the metadata was fetched from; package `location` hrefs are
     /// relative to this. Needed to build RPM download URLs.
     pub base_url: String,
+}
+
+impl RepoMetadata {
+    /// Wrap cache bytes, validating the rkyv layout once so a corrupt/old-format
+    /// cache is rejected here (the caller then falls through to a refresh),
+    /// exactly as the previous checked-deserialize did.
+    fn from_bytes(
+        repo_id: String,
+        bytes: MetaBytes,
+        from_cache: bool,
+        base_url: String,
+    ) -> Result<Self, RepoError> {
+        let archived = rkyv::access::<ArchivedStore, rkyv::rancor::Error>(&bytes)
+            .map_err(|e| RepoError::Xml(format!("corrupt metadata cache: {e}")))?;
+        let len = archived.len();
+        Ok(RepoMetadata {
+            repo_id,
+            bytes,
+            len,
+            from_cache,
+            base_url,
+        })
+    }
+
+    /// The archived interned store backing this repo.
+    fn store(&self) -> &ArchivedStore {
+        // SAFETY: `bytes` was validated by `rkyv::access` in `from_bytes` and is
+        // immutable for the lifetime of `self`, so unchecked access is sound.
+        unsafe { rkyv::access_unchecked::<ArchivedStore>(&self.bytes) }
+    }
+
+    /// Zero-copy `&str` views over the packages (query commands).
+    pub fn views(&self) -> impl Iterator<Item = PkgView<'_>> {
+        self.store().views()
+    }
+
+    /// Materialize owned packages (used by the resolve/download path, which
+    /// mutates and indexes them).
+    pub fn to_owned_packages(&self) -> Vec<AvailablePackage> {
+        self.store().to_owned_packages()
+    }
+
+    /// Rehydrate a single package by its index within this repo (to materialize
+    /// only the resolver's winning set).
+    pub fn rehydrate(&self, idx: usize) -> Option<AvailablePackage> {
+        self.store().package_at(idx)
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
 }
 
 /// Options controlling a sync.
@@ -92,24 +174,38 @@ impl SyncOptions {
 pub fn sync_repo(repo: &Repo, opts: &SyncOptions) -> Result<RepoMetadata, RepoError> {
     let dir = opts.cachedir.join(&repo.id);
     let repomd_path = dir.join("repomd.xml");
-    let primary_path = dir.join("primary.xml");
+    // Parsed-metadata cache: the primary.xml parsed into AvailablePackages and
+    // serialized with rkyv, so warm runs skip re-parsing tens of MB of XML and
+    // query commands read it zero-copy (mmap'd, page-aligned) without a
+    // deserialize. Lives entirely under rum's own cachedir (never touches
+    // dnf/yum's cache).
+    let primary_cache = dir.join("primary.rkyv");
     let baseurl_path = dir.join("baseurl");
 
-    // Fast path: fresh cache with a parsed-primary file and a recorded base URL.
-    if !opts.force_refresh && primary_path.exists() && is_fresh(&repomd_path, repo.metadata_expire)
+    // Fast path: fresh parsed cache plus a recorded base URL.
+    if !opts.force_refresh && primary_cache.exists() && is_fresh(&repomd_path, repo.metadata_expire)
     {
         if let Ok(base_url) = std::fs::read_to_string(&baseurl_path) {
-            let xml = read_file(&primary_path)?;
-            let packages = primary::parse(&xml, &repo.id)?;
-            tracing::debug!(repo = %repo.id, count = packages.len(), "loaded from cache");
-            return Ok(RepoMetadata {
-                repo_id: repo.id.clone(),
-                packages,
-                from_cache: true,
-                base_url: base_url.trim().to_string(),
-            });
+            if let Ok(file) = std::fs::File::open(&primary_cache) {
+                // SAFETY: the cache is rum's own file; we treat it as immutable
+                // and validate its rkyv layout in `from_bytes`.
+                if let Ok(mmap) = unsafe { memmap2::Mmap::map(&file) } {
+                    match RepoMetadata::from_bytes(
+                        repo.id.clone(),
+                        MetaBytes::Mapped(mmap),
+                        true,
+                        base_url.trim().to_string(),
+                    ) {
+                        Ok(md) => {
+                            tracing::debug!(repo = %repo.id, count = md.len(), "loaded parsed cache");
+                            return Ok(md);
+                        }
+                        // Corrupt/old-format cache: fall through and refresh.
+                        Err(e) => tracing::debug!(repo = %repo.id, "cache rejected: {e}"),
+                    }
+                }
+            }
         }
-        // No cached base URL (older cache): fall through and refresh.
     }
 
     // Refresh: build an HTTP client honouring this repo's TLS settings, then
@@ -134,31 +230,119 @@ pub fn sync_repo(repo: &Repo, opts: &SyncOptions) -> Result<RepoMetadata, RepoEr
         });
     }
 
-    // Decompress and, if advertised, verify the decompressed checksum too.
-    let plain = decompress::decompress(&primary_entry.location, &compressed)?;
-    if let Some(oc) = &primary_entry.open_checksum {
-        if !oc.verify(&plain) {
-            return Err(RepoError::ChecksumMismatch {
-                repo: repo.id.clone(),
-                file: format!("{} (decompressed)", primary_entry.location),
-            });
-        }
-    }
+    // Spill the compressed primary to disk and mmap it, rather than holding it
+    // (tens to >100MB on RHEL) on the heap through the memory-heavy parse. The
+    // mmap is file-backed / evictable, so on a small host the resident set stays
+    // dominated by just the parsed packages + the rkyv buffer. (A 761MB
+    // t2.micro OOM'd syncing RHEL BaseOS with the compressed blob heap-resident.)
+    std::fs::create_dir_all(&dir).map_err(|source| RepoError::Io {
+        path: dir.clone(),
+        source,
+    })?;
+    let download_tmp = dir.join("primary.download");
+    std::fs::write(&download_tmp, &compressed).map_err(|source| RepoError::Io {
+        path: download_tmp.clone(),
+        source,
+    })?;
+    drop(compressed);
 
-    let packages = primary::parse(&plain, &repo.id)?;
-    tracing::info!(repo = %repo.id, count = packages.len(), %base, "refreshed metadata");
+    // Stream-decompress + stream-parse from the mmap so the (up to ~1-2GB on
+    // RHEL) decompressed XML is never fully materialized either. The compressed
+    // checksum verified above already guarantees integrity, so the (optional,
+    // secondary) open-checksum over the decompressed bytes is skipped.
+    let packages = {
+        let file = std::fs::File::open(&download_tmp).map_err(|source| RepoError::Io {
+            path: download_tmp.clone(),
+            source,
+        })?;
+        // SAFETY: our own freshly-written file, treated as immutable here.
+        let mmap = unsafe { memmap2::Mmap::map(&file) }.map_err(|source| RepoError::Io {
+            path: download_tmp.clone(),
+            source,
+        })?;
+        let plain = decompress::reader(&primary_entry.location, &mmap)?;
+        primary::parse_reader(plain, &repo.id)?
+    };
+    let _ = std::fs::remove_file(&download_tmp);
+    tracing::info!(repo = %repo.id, count = packages.packages.len(), %base, "refreshed metadata");
 
-    // Persist to cache (best-effort ordering: primary last so a present
-    // primary.xml always has a matching repomd.xml alongside it).
-    write_cache(&dir, &repomd_path, &repomd_bytes, &primary_path, &plain)?;
+    // Persist to cache: repomd.xml (freshness anchor) plus the interned store
+    // serialized with rkyv to primary.rkyv (written last, so a present parsed
+    // cache always has a matching repomd.xml governing its freshness).
+    let encoded = rkyv::to_bytes::<rkyv::rancor::Error>(&packages)
+        .map_err(|e| RepoError::Xml(format!("failed to serialize metadata cache: {e}")))?;
+    // Drop the interned store before writing/mapping so we don't hold it and the
+    // serialized buffer at once.
+    drop(packages);
+    write_cache(&dir, &repomd_path, &repomd_bytes, &primary_cache, &encoded)?;
     let _ = std::fs::write(&baseurl_path, &base);
 
-    Ok(RepoMetadata {
-        repo_id: repo.id.clone(),
-        packages,
-        from_cache: false,
-        base_url: base,
-    })
+    // Prefer an mmap of the just-written cache over keeping the (large) rkyv
+    // buffer resident: sync_all retains one RepoMetadata per repo, so several
+    // big repos (RHEL BaseOS + AppStream) would otherwise pin hundreds of MB of
+    // heap at once and OOM a small host. The mmap is file-backed and evictable.
+    let bytes = match std::fs::File::open(&primary_cache)
+        .ok()
+        .and_then(|f| unsafe { memmap2::Mmap::map(&f) }.ok())
+    {
+        Some(mmap) => {
+            drop(encoded);
+            MetaBytes::Mapped(mmap)
+        }
+        None => MetaBytes::Owned(encoded),
+    };
+    RepoMetadata::from_bytes(repo.id.clone(), bytes, false, base)
+}
+
+/// Lazily load file ownership from a repo's `filelists.xml`, filtered to
+/// `wanted` file paths. Returns `(pkgid, files)` where `pkgid` matches an
+/// `AvailablePackage::checksum.hex`. Uses the cached repomd.xml + base URL from
+/// a prior [`sync_repo`]; downloads and caches filelists.xml on first use.
+///
+/// This is the fallback for file-based dependencies whose paths are not in
+/// `primary.xml` (createrepo's core-files filter). It is only called when a
+/// resolve fails on such a path, so the large filelists file is never fetched
+/// on the warm path.
+pub fn load_filelists(
+    repo: &Repo,
+    opts: &SyncOptions,
+    wanted: &std::collections::HashSet<String>,
+) -> Result<Vec<(String, Vec<String>)>, RepoError> {
+    let dir = opts.cachedir.join(&repo.id);
+    let repomd_bytes = read_file(&dir.join("repomd.xml"))?;
+    let md = RepoMd::parse(&String::from_utf8_lossy(&repomd_bytes))?;
+    let entry = md.get("filelists").ok_or_else(|| RepoError::NoPrimary {
+        repo: repo.id.clone(),
+    })?;
+
+    // Cache the *compressed* filelists (tens of MB) rather than the decompressed
+    // form (~100MB+); we stream-decompress+parse it so it's never fully in RAM.
+    let cache = dir.join("filelists.cache");
+    let compressed = match std::fs::read(&cache) {
+        Ok(bytes) if entry.checksum.verify(&bytes) => bytes,
+        _ => {
+            let baseurl_path = dir.join("baseurl");
+            let base_url =
+                std::fs::read_to_string(&baseurl_path).map_err(|source| RepoError::Io {
+                    path: baseurl_path,
+                    source,
+                })?;
+            let http = Http::for_repo(repo)?;
+            let url = join_url(base_url.trim(), &entry.location);
+            let bytes = http.get_bytes(&url)?;
+            if !entry.checksum.verify(&bytes) {
+                return Err(RepoError::ChecksumMismatch {
+                    repo: repo.id.clone(),
+                    file: entry.location.clone(),
+                });
+            }
+            let _ = std::fs::write(&cache, &bytes);
+            bytes
+        }
+    };
+
+    let reader = decompress::reader(&entry.location, &compressed)?;
+    filelists::parse(reader, wanted)
 }
 
 /// Sync many repos in parallel. Returns one result per repo (in the input
@@ -263,12 +447,15 @@ fn read_file(path: &Path) -> Result<Vec<u8>, RepoError> {
     })
 }
 
+/// Write the freshness anchor (repomd.xml) and the parsed-metadata cache
+/// (primary.rkyv). repomd is written first so the parsed cache never appears
+/// without a repomd governing its freshness.
 fn write_cache(
     dir: &Path,
     repomd_path: &Path,
     repomd: &[u8],
-    primary_path: &Path,
-    primary: &[u8],
+    primary_cache: &Path,
+    parsed: &[u8],
 ) -> Result<(), RepoError> {
     std::fs::create_dir_all(dir).map_err(|source| RepoError::Io {
         path: dir.to_path_buf(),
@@ -278,8 +465,8 @@ fn write_cache(
         path: repomd_path.to_path_buf(),
         source,
     })?;
-    std::fs::write(primary_path, primary).map_err(|source| RepoError::Io {
-        path: primary_path.to_path_buf(),
+    std::fs::write(primary_cache, parsed).map_err(|source| RepoError::Io {
+        path: primary_cache.to_path_buf(),
         source,
     })?;
     Ok(())

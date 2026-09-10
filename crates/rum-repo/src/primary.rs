@@ -10,10 +10,13 @@ use quick_xml::Reader;
 use rum_solve::{Dep, DepFlag, Evr};
 
 use crate::checksum::{Checksum, ChecksumKind};
+use crate::interned::{IDep, IPackage, Interner, Store, Sym};
 use crate::RepoError;
 
-/// A package as advertised by a repository (not necessarily installed).
-#[derive(Debug, Clone)]
+/// A package as advertised by a repository (not necessarily installed). This is
+/// the owned form handed to the resolve/download path; the cache itself stores
+/// the compact interned [`Store`].
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AvailablePackage {
     pub name: String,
     /// Epoch as advertised; 0 means "no epoch" for display purposes.
@@ -33,6 +36,9 @@ pub struct AvailablePackage {
     pub provides: Vec<Dep>,
     /// Capabilities this package requires (from `<format><rpm:requires>`).
     pub requires: Vec<Dep>,
+    /// Weak dependencies (from `<format><rpm:recommends>`); installed by
+    /// default when satisfiable, matching dnf's `install_weak_deps=1`.
+    pub recommends: Vec<Dep>,
     /// File paths this package advertises in primary (satisfy file deps).
     pub files: Vec<String>,
 }
@@ -53,12 +59,20 @@ impl AvailablePackage {
     }
 }
 
-/// Parse the decompressed primary.xml, tagging every package with `repo_id`.
-pub fn parse(xml: &[u8], repo_id: &str) -> Result<Vec<AvailablePackage>, RepoError> {
-    let mut reader = Reader::from_reader(xml);
+/// Parse primary.xml from any reader into the interned [`Store`].
+///
+/// Reads incrementally (via an internal `BufReader`) so a large decompressed
+/// primary (RHEL's runs to ~1-2GB) is never fully materialized, and interns
+/// every string as it goes so the retained form is symbols + a shared arena
+/// rather than millions of owned `String`s (that OOM'd a 761MB host on RHEL
+/// BaseOS). Only symbols and the arena are kept; `&str` is resolved on demand.
+pub fn parse_reader<R: std::io::Read>(input: R, repo_id: &str) -> Result<Store, RepoError> {
+    let mut reader = Reader::from_reader(std::io::BufReader::new(input));
     reader.config_mut().trim_text(true);
 
-    let mut out = Vec::new();
+    let mut itn = Interner::new();
+    let repo_sym = itn.intern(repo_id);
+    let mut out: Vec<IPackage> = Vec::new();
     let mut buf = Vec::new();
 
     let mut cur: Option<Builder> = None;
@@ -96,8 +110,9 @@ pub fn parse(xml: &[u8], repo_id: &str) -> Result<Vec<AvailablePackage>, RepoErr
                                 b"size" => b.read_size(&e),
                                 b"provides" => dep_ctx = DepCtx::Provides,
                                 b"requires" => dep_ctx = DepCtx::Requires,
-                                b"conflicts" | b"obsoletes" | b"suggests" | b"recommends"
-                                | b"enhances" | b"supplements" => dep_ctx = DepCtx::None,
+                                b"recommends" => dep_ctx = DepCtx::Recommends,
+                                b"conflicts" | b"obsoletes" | b"suggests" | b"enhances"
+                                | b"supplements" => dep_ctx = DepCtx::None,
                                 b"file" => field = Field::File,
                                 b"entry" => push_entry(b, dep_ctx, &e),
                                 _ => field = Field::None,
@@ -145,7 +160,7 @@ pub fn parse(xml: &[u8], repo_id: &str) -> Result<Vec<AvailablePackage>, RepoErr
                 let name = e.local_name().as_ref().to_vec();
                 if name.as_slice() == b"package" {
                     if let Some(b) = cur.take() {
-                        if let Some(pkg) = b.finish(repo_id) {
+                        if let Some(pkg) = b.finish_interned(&mut itn, repo_sym) {
                             out.push(pkg);
                         }
                     }
@@ -153,7 +168,7 @@ pub fn parse(xml: &[u8], repo_id: &str) -> Result<Vec<AvailablePackage>, RepoErr
                     depth_in_package -= 1;
                     if matches!(
                         name.as_slice(),
-                        b"provides" | b"requires" | b"conflicts" | b"obsoletes"
+                        b"provides" | b"requires" | b"recommends" | b"conflicts" | b"obsoletes"
                     ) {
                         dep_ctx = DepCtx::None;
                     }
@@ -167,7 +182,7 @@ pub fn parse(xml: &[u8], repo_id: &str) -> Result<Vec<AvailablePackage>, RepoErr
         buf.clear();
     }
 
-    Ok(out)
+    Ok(itn.into_store(out))
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -186,6 +201,7 @@ enum DepCtx {
     None,
     Provides,
     Requires,
+    Recommends,
 }
 
 /// Push an `<rpm:entry>` into the provides/requires list per the active context.
@@ -197,6 +213,7 @@ fn push_entry(b: &mut Builder, ctx: DepCtx, e: &quick_xml::events::BytesStart) {
         match ctx {
             DepCtx::Provides => b.provides.push(d),
             DepCtx::Requires => b.requires.push(d),
+            DepCtx::Recommends => b.recommends.push(d),
             DepCtx::None => {}
         }
     }
@@ -230,6 +247,7 @@ struct Builder {
     pending_cksum_kind: Option<ChecksumKind>,
     provides: Vec<Dep>,
     requires: Vec<Dep>,
+    recommends: Vec<Dep>,
     files: Vec<String>,
 }
 
@@ -246,24 +264,34 @@ impl Builder {
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
     }
-    fn finish(self, repo_id: &str) -> Option<AvailablePackage> {
+    /// Intern this package's fields into `itn`, producing a compact [`IPackage`].
+    /// `repo_sym` is the pre-interned repo id (constant across the parse).
+    fn finish_interned(self, itn: &mut Interner, repo_sym: Sym) -> Option<IPackage> {
         if self.name.is_empty() || self.version.is_empty() || self.location.is_empty() {
             return None;
         }
-        Some(AvailablePackage {
-            name: self.name,
+        let checksum = self.checksum?;
+        let idep = |itn: &mut Interner, d: &Dep| IDep {
+            name: itn.intern(&d.name),
+            evr: itn.intern_evr(&d.evr),
+            flag: d.flag,
+        };
+        Some(IPackage {
+            name: itn.intern(&self.name),
             epoch: self.epoch,
-            version: self.version,
-            release: self.release,
-            arch: self.arch,
-            summary: self.summary,
+            version: itn.intern(&self.version),
+            release: itn.intern(&self.release),
+            arch: itn.intern(&self.arch),
+            summary: itn.intern(&self.summary),
             size: self.size,
-            location: self.location,
-            checksum: self.checksum?,
-            repo_id: repo_id.to_string(),
-            provides: self.provides,
-            requires: self.requires,
-            files: self.files,
+            location: itn.intern(&self.location),
+            checksum_kind: checksum.kind,
+            checksum_hex: itn.intern(&checksum.hex),
+            repo_id: repo_sym,
+            provides: self.provides.iter().map(|d| idep(itn, d)).collect(),
+            requires: self.requires.iter().map(|d| idep(itn, d)).collect(),
+            recommends: self.recommends.iter().map(|d| idep(itn, d)).collect(),
+            files: self.files.iter().map(|f| itn.intern(f)).collect(),
         })
     }
 }
@@ -305,6 +333,9 @@ mod tests {
                 <rpm:entry name="glibc" flags="GE" epoch="0" ver="2.34"/>
                 <rpm:entry name="/bin/sh"/>
               </rpm:requires>
+              <rpm:recommends>
+                <rpm:entry name="bash-completion"/>
+              </rpm:recommends>
               <file>/usr/bin/bash</file>
               <file type="dir">/etc/bash</file>
               <checksum>should-not-be-picked</checksum>
@@ -321,7 +352,13 @@ mod tests {
           </package>
         </metadata>"#;
 
-        let pkgs = parse(xml, "baseos").unwrap();
+        // Parse to the interned store, then round-trip through the archived
+        // form (the real warm-cache path) to owned packages for assertions.
+        let store = parse_reader(&xml[..], "baseos").unwrap();
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&store).unwrap();
+        let archived =
+            rkyv::access::<crate::interned::ArchivedStore, rkyv::rancor::Error>(&bytes).unwrap();
+        let pkgs = archived.to_owned_packages();
         assert_eq!(pkgs.len(), 2);
 
         let bash = &pkgs[0];
@@ -341,6 +378,8 @@ mod tests {
         assert_eq!(bash.requires[0].name, "glibc");
         assert_eq!(bash.requires[0].flag, rum_solve::DepFlag::Ge);
         assert!(bash.requires[1].evr.is_none()); // /bin/sh unversioned
+        assert_eq!(bash.recommends.len(), 1);
+        assert_eq!(bash.recommends[0].name, "bash-completion");
         assert_eq!(bash.files, vec!["/usr/bin/bash", "/etc/bash"]);
 
         let zlib = &pkgs[1];

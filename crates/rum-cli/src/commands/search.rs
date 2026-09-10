@@ -15,10 +15,12 @@ pub fn run(terms: &[String]) -> anyhow::Result<()> {
     // (dnf's default AND semantics across terms).
     let mut hits: Vec<(String, String)> = Vec::new();
     let mut seen = BTreeSet::new();
-    for p in &synced.packages {
-        let hay = format!("{} {}", p.name, p.summary).to_lowercase();
-        if needles.iter().all(|n| hay.contains(n)) && seen.insert(p.name_arch()) {
-            hits.push((p.name_arch(), p.summary.clone()));
+    for m in synced.metas() {
+        for p in m.views() {
+            let hay = format!("{} {}", p.name(), p.summary()).to_lowercase();
+            if needles.iter().all(|n| hay.contains(n)) && seen.insert(p.name_arch()) {
+                hits.push((p.name_arch(), p.summary().to_string()));
+            }
         }
     }
     hits.sort_by(|a, b| a.0.cmp(&b.0));

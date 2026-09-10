@@ -40,3 +40,23 @@ jobs:
 
       - name: Test
         run: cargo test --all --all-features
+
+  # Real-RPM-system integration test: rum coexists with dnf/yum on a shared
+  # rpmdb (a dnf-installed package is seen by rum and not reinstalled; rum's
+  # own install/remove are real rpm transactions). Runs in a RockyLinux
+  # container because it needs a working rpmdb, dnf, and the distro repos.
+  integration:
+    name: coexistence (RockyLinux 9)
+    runs-on: ubuntu-latest
+    container: rockylinux:9
+    steps:
+      - name: Install toolchain
+        run: dnf install -y gcc rpm-devel cargo rust git tar
+
+      - uses: actions/checkout@v4
+
+      - name: Build rum
+        run: cargo build --release --bin rum
+
+      - name: Coexistence / idempotency test
+        run: RUM=./target/release/rum bash tests/integration/coexistence.sh

@@ -48,12 +48,12 @@ fn list_available(patterns: &[String]) -> anyhow::Result<()> {
     // --showduplicates), excluding anything already installed at an equal or
     // newer EVR (nothing to offer).
     let installed = pkgindex::installed_best();
-    let best = pkgindex::available_best(synced.packages);
+    let best = pkgindex::available_best(synced.metas());
 
     let mut avail: Vec<_> = best
         .into_values()
         .filter(|p| match installed.get(&p.name_arch()) {
-            Some(inst) => pkgindex::available_evr(p) > *inst,
+            Some(inst) => p.evr_cmp() > *inst,
             None => true,
         })
         .filter(|p| patterns.is_empty() || patterns.iter().any(|pat| available_matches(pat, p)))
@@ -89,7 +89,7 @@ fn installed_matches(pattern: &str, p: &Package) -> bool {
     glob::matches(pattern, &p.name) || glob::matches(pattern, &p.name_arch())
 }
 
-fn available_matches(pattern: &str, p: &rum_repo::AvailablePackage) -> bool {
+fn available_matches(pattern: &str, p: &pkgindex::AvailRow) -> bool {
     glob::matches(pattern, &p.name) || glob::matches(pattern, &p.name_arch())
 }
 

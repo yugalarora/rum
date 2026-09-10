@@ -11,18 +11,30 @@
 
 mod dep;
 mod resolve;
+mod richdep;
 mod sat;
 mod vercmp;
 
 use std::cmp::Ordering;
 
-pub use dep::{Dep, DepFlag};
+pub use dep::{ArchivedDepFlag, Dep, DepFlag};
 pub use resolve::{resolve, Candidate, ResolveError, Resolved};
-pub use sat::resolve_sat;
+pub use sat::{resolve_sat, resolve_sat_with, CandidateRef, CandidateSource, NameView};
 pub use vercmp::rpmvercmp;
 
 /// An epoch:version-release tuple, RPM's unit of "which build is newer".
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 pub struct Evr {
     /// A missing epoch is treated as 0 (RPM/dnf convention).
     pub epoch: u64,

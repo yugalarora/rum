@@ -14,11 +14,10 @@
 //!     of gratuitously upgrading them — matching `dnf install` semantics.
 //!
 //! Versioned requirements are expressed as `Ranges<Evr>` over our RPM-correct
-//! `Evr` ordering, so the solver's version choices use real rpmvercmp. The one
-//! approximation is a versioned *virtual* Provides whose version differs from
-//! the providing package's version (rare); such a requirement is matched
-//! against the package version. This yields real backtracking and matches dnf
-//! on ordinary closures.
+//! `Evr` ordering, so the solver's version choices use real rpmvercmp. A
+//! versioned Provides carries its own advertised version; an *unversioned*
+//! Provides is flagged a wildcard and satisfies any require (RPM's rpmdsCompare
+//! rule). This yields real backtracking and matches dnf on ordinary closures.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
@@ -26,14 +25,99 @@ use std::fmt::Display;
 use resolvo::utils::Pool;
 use resolvo::{
     Candidates, Condition, ConditionId, ConditionalRequirement, Dependencies, DependencyProvider,
-    Interner, KnownDependencies, NameId, Problem, SolvableId, Solver, SolverCache, StringId,
-    UnsolvableOrCancelled, VersionSetId, VersionSetUnionId,
+    Interner, KnownDependencies, LogicalOperator, NameId, Problem, Requirement, SolvableId, Solver,
+    SolverCache, StringId, UnsolvableOrCancelled, VersionSetId, VersionSetUnionId,
 };
 use version_ranges::Ranges;
 
 use crate::dep::DepFlag;
 use crate::resolve::{Candidate, ResolveError, Resolved};
+use crate::richdep::{self, RichExpr};
 use crate::{Dep, Evr};
+
+/// A borrowed view of one candidate package, valid only for the duration of a
+/// single visit. This lets the solver read package data (name, deps) straight
+/// from a caller's zero-copy store (e.g. rum-repo's mmap'd metadata) without
+/// materializing an owned `Candidate` for every package — essential for large
+/// repos on small hosts.
+pub struct CandidateRef<'a> {
+    /// Caller-defined handle (e.g. a global package index) echoed back in the
+    /// resolved set.
+    pub id: usize,
+    pub name: &'a str,
+    pub arch: &'a str,
+    pub evr: Evr,
+    pub provides: &'a [Dep],
+    pub requires: &'a [Dep],
+    pub recommends: &'a [Dep],
+}
+
+/// A name-only view of one candidate, for the cheap pre-passes (which capability
+/// names are provided/required/recommended). Carries borrowed `&str`s, so no
+/// `Dep`/`String` is allocated — unlike [`CandidateRef`], whose owned `Dep`
+/// vectors are only needed for the final pool build.
+pub struct NameView<'a> {
+    pub name: &'a str,
+    pub arch: &'a str,
+    /// Provided capability names (excluding files — see the providable pass).
+    pub provide_names: &'a [&'a str],
+    pub require_names: &'a [&'a str],
+    pub recommend_names: &'a [&'a str],
+}
+
+/// A source of candidates that can be scanned repeatedly without holding them
+/// all in memory at once. The solver runs one cheap `scan_names` pre-pass
+/// (requested/providable/required sets) and one full `scan` to build the pool,
+/// so implementations must be cheap to re-iterate.
+pub trait CandidateSource {
+    /// Full candidates (with owned `Dep`s); used once, to build the pool.
+    /// `required` is the set of capability names the pool will actually
+    /// register, so implementations may drop provides/files not in it (the
+    /// build ignores them anyway) to avoid allocating `Dep`s for the millions
+    /// of never-depended-upon files in a distro's metadata.
+    fn scan(&self, required: &HashSet<String>, visit: &mut dyn FnMut(CandidateRef<'_>));
+    /// Name-only pass (borrowed `&str`, no `Dep` allocation); used for the
+    /// providable/required/requested sets.
+    fn scan_names(&self, visit: &mut dyn FnMut(NameView<'_>));
+}
+
+/// A slice of owned `Candidate`s is a trivial source (used by tests and the
+/// greedy path). Its `id` is the candidate's own `id` field.
+impl CandidateSource for [Candidate] {
+    fn scan(&self, required: &HashSet<String>, visit: &mut dyn FnMut(CandidateRef<'_>)) {
+        for c in self {
+            let provides: Vec<Dep> = c
+                .provides
+                .iter()
+                .filter(|d| required.contains(&d.name))
+                .cloned()
+                .collect();
+            visit(CandidateRef {
+                id: c.id,
+                name: &c.name,
+                arch: &c.arch,
+                evr: c.evr.clone(),
+                provides: &provides,
+                requires: &c.requires,
+                recommends: &c.recommends,
+            });
+        }
+    }
+    fn scan_names(&self, visit: &mut dyn FnMut(NameView<'_>)) {
+        for c in self {
+            let pv: Vec<&str> = c.provides.iter().map(|d| d.name.as_str()).collect();
+            let rq: Vec<&str> = c.requires.iter().map(|d| d.name.as_str()).collect();
+            let rc: Vec<&str> = c.recommends.iter().map(|d| d.name.as_str()).collect();
+            visit(NameView {
+                name: &c.name,
+                arch: &c.arch,
+                provide_names: &pv,
+                require_names: &rq,
+                recommend_names: &rc,
+            });
+        }
+    }
+}
 
 struct RpmProvider {
     pool: Pool<Ranges<Evr>>,
@@ -50,9 +134,218 @@ struct RpmProvider {
     /// package version, not the solvable's record (which for a capability
     /// provider is the *provided* version and can tie across package builds).
     pkg_evr: HashMap<SolvableId, Evr>,
+    /// Solvables created from an *unversioned* Provides (or a file). Per RPM's
+    /// `rpmdsCompare`, a versionless provide satisfies ANY versioned require, so
+    /// these must pass the version-set filter unconditionally.
+    wildcard: HashSet<SolvableId>,
+    /// Conditions referenced by conditional requirements (rich/boolean deps),
+    /// indexed by `ConditionId`.
+    conditions: Vec<Condition>,
+    /// The originating Dep for each versioned version-set, so `filter_candidates`
+    /// can apply RPM's partial-EVR comparison (e.g. `= 15.0.7` with no release
+    /// matches `15.0.7-3.amzn2023.0.4`) instead of an exact Ranges match.
+    vsdep: HashMap<VersionSetId, Dep>,
 }
 
-fn version_set(pool: &Pool<Ranges<Evr>>, cap: NameId, dep: &Dep) -> VersionSetId {
+/// `rpmlib(...)` feature flags are satisfied by rpm itself, not repo packages.
+fn is_ignorable_dep(name: &str) -> bool {
+    name.starts_with("rpmlib(")
+}
+
+/// Collect every capability name referenced (as a Term) in a rich expression.
+fn collect_rich_names(e: &RichExpr, out: &mut HashSet<String>) {
+    match e {
+        RichExpr::Term(d) => {
+            out.insert(d.name.clone());
+        }
+        RichExpr::And(a, b)
+        | RichExpr::Or(a, b)
+        | RichExpr::If(a, b)
+        | RichExpr::Unless(a, b)
+        | RichExpr::With(a, b)
+        | RichExpr::Without(a, b) => {
+            collect_rich_names(a, out);
+            collect_rich_names(b, out);
+        }
+        RichExpr::IfElse(a, b, c) | RichExpr::UnlessElse(a, b, c) => {
+            collect_rich_names(a, out);
+            collect_rich_names(b, out);
+            collect_rich_names(c, out);
+        }
+    }
+}
+
+/// Mint a new ConditionId for `cond`.
+fn mint(conds: &mut Vec<Condition>, cond: Condition) -> ConditionId {
+    let id = ConditionId::new(conds.len() as u32);
+    conds.push(cond);
+    id
+}
+
+/// Build a resolvo Condition from a rich expression (used on the condition side
+/// of `if`/`unless`). and/or become Binary; anything else falls back to its
+/// leftmost term.
+fn build_cond(
+    pool: &Pool<Ranges<Evr>>,
+    conds: &mut Vec<Condition>,
+    vsdep: &mut HashMap<VersionSetId, Dep>,
+    e: &RichExpr,
+) -> ConditionId {
+    match e {
+        RichExpr::And(a, b) => {
+            let ca = build_cond(pool, conds, vsdep, a);
+            let cb = build_cond(pool, conds, vsdep, b);
+            mint(conds, Condition::Binary(LogicalOperator::And, ca, cb))
+        }
+        RichExpr::Or(a, b) => {
+            let ca = build_cond(pool, conds, vsdep, a);
+            let cb = build_cond(pool, conds, vsdep, b);
+            mint(conds, Condition::Binary(LogicalOperator::Or, ca, cb))
+        }
+        RichExpr::Term(d) => {
+            let cap = pool.intern_package_name(d.name.clone());
+            mint(
+                conds,
+                Condition::Requirement(version_set(pool, vsdep, cap, d)),
+            )
+        }
+        // Rare: a compound condition; approximate with its leftmost term.
+        RichExpr::If(a, _)
+        | RichExpr::IfElse(a, _, _)
+        | RichExpr::Unless(a, _)
+        | RichExpr::UnlessElse(a, _, _)
+        | RichExpr::With(a, _)
+        | RichExpr::Without(a, _) => build_cond(pool, conds, vsdep, a),
+    }
+}
+
+/// Collect the version sets of all Term leaves (used to build an OR union).
+fn collect_or_vss(
+    pool: &Pool<Ranges<Evr>>,
+    vsdep: &mut HashMap<VersionSetId, Dep>,
+    e: &RichExpr,
+    out: &mut Vec<VersionSetId>,
+) {
+    match e {
+        RichExpr::Term(d) => {
+            let cap = pool.intern_package_name(d.name.clone());
+            out.push(version_set(pool, vsdep, cap, d));
+        }
+        RichExpr::And(a, b) | RichExpr::Or(a, b) => {
+            collect_or_vss(pool, vsdep, a, out);
+            collect_or_vss(pool, vsdep, b, out);
+        }
+        _ => {}
+    }
+}
+
+/// Is a condition expression already satisfied by the installed system? RPM's
+/// `if`/`unless` condition on installed state, so we pre-evaluate against the
+/// installed capabilities (by name).
+fn cond_installed(e: &RichExpr, installed: &HashSet<String>) -> bool {
+    match e {
+        RichExpr::Term(d) => installed.contains(&d.name),
+        RichExpr::And(a, b) => cond_installed(a, installed) && cond_installed(b, installed),
+        RichExpr::Or(a, b) => cond_installed(a, installed) || cond_installed(b, installed),
+        RichExpr::If(a, _)
+        | RichExpr::IfElse(a, _, _)
+        | RichExpr::Unless(a, _)
+        | RichExpr::UnlessElse(a, _, _)
+        | RichExpr::With(a, _)
+        | RichExpr::Without(a, _) => cond_installed(a, installed),
+    }
+}
+
+/// Map a rich expression to resolvo conditional requirements, appending to `out`.
+/// `cond` is an ambient condition (from an enclosing `if`). `installed` is the
+/// set of installed capability names, used to pre-evaluate `if`/`unless`.
+#[allow(clippy::too_many_arguments)]
+fn emit_rich(
+    pool: &Pool<Ranges<Evr>>,
+    conds: &mut Vec<Condition>,
+    vsdep: &mut HashMap<VersionSetId, Dep>,
+    installed: &HashSet<String>,
+    e: &RichExpr,
+    cond: Option<ConditionId>,
+    out: &mut Vec<ConditionalRequirement>,
+) {
+    match e {
+        RichExpr::Term(d) => {
+            let cap = pool.intern_package_name(d.name.clone());
+            out.push(ConditionalRequirement {
+                condition: cond,
+                requirement: Requirement::Single(version_set(pool, vsdep, cap, d)),
+            });
+        }
+        RichExpr::And(a, b) => {
+            emit_rich(pool, conds, vsdep, installed, a, cond, out);
+            emit_rich(pool, conds, vsdep, installed, b, cond, out);
+        }
+        RichExpr::Or(..) => {
+            let mut vss = Vec::new();
+            collect_or_vss(pool, vsdep, e, &mut vss);
+            if let Some((first, rest)) = vss.split_first() {
+                let union = pool.intern_version_set_union(*first, rest.iter().copied());
+                out.push(ConditionalRequirement {
+                    condition: cond,
+                    requirement: Requirement::Union(union),
+                });
+            }
+        }
+        // `then if cond`: if cond already holds on the system, require `then`
+        // unconditionally; otherwise make it conditional on cond entering the
+        // transaction (so both dnf senses — installed or co-installed — work).
+        RichExpr::If(then, c) => {
+            if cond_installed(c, installed) {
+                emit_rich(pool, conds, vsdep, installed, then, cond, out);
+            } else {
+                let cid = build_cond(pool, conds, vsdep, c);
+                let combined = match cond {
+                    None => cid,
+                    Some(o) => mint(conds, Condition::Binary(LogicalOperator::And, o, cid)),
+                };
+                emit_rich(pool, conds, vsdep, installed, then, Some(combined), out);
+            }
+        }
+        // `then if cond else els`: pick the branch by installed state.
+        RichExpr::IfElse(then, c, els) => {
+            let branch = if cond_installed(c, installed) {
+                then
+            } else {
+                els
+            };
+            emit_rich(pool, conds, vsdep, installed, branch, cond, out);
+        }
+        // `body unless cond`: require body unless cond is present.
+        RichExpr::Unless(body, c) => {
+            if !cond_installed(c, installed) {
+                emit_rich(pool, conds, vsdep, installed, body, cond, out);
+            }
+        }
+        RichExpr::UnlessElse(body, c, els) => {
+            let branch = if cond_installed(c, installed) {
+                els
+            } else {
+                body
+            };
+            emit_rich(pool, conds, vsdep, installed, branch, cond, out);
+        }
+        // `with`/`without`: no intersection in resolvo; require the primary
+        // operand (approximation, documented).
+        RichExpr::With(a, _) | RichExpr::Without(a, _) => {
+            emit_rich(pool, conds, vsdep, installed, a, cond, out)
+        }
+    }
+}
+
+fn version_set(
+    pool: &Pool<Ranges<Evr>>,
+    vsdep: &mut HashMap<VersionSetId, Dep>,
+    cap: NameId,
+    dep: &Dep,
+) -> VersionSetId {
+    // The Ranges is a coarse approximation kept for display; the authoritative
+    // match happens in filter_candidates via the stored Dep (RPM semantics).
     let ranges = match (&dep.evr, dep.flag) {
         (None, _) | (_, DepFlag::Any) => Ranges::full(),
         (Some(e), DepFlag::Eq) => Ranges::singleton(e.clone()),
@@ -61,7 +354,11 @@ fn version_set(pool: &Pool<Ranges<Evr>>, cap: NameId, dep: &Dep) -> VersionSetId
         (Some(e), DepFlag::Gt) => Ranges::strictly_higher_than(e.clone()),
         (Some(e), DepFlag::Ge) => Ranges::higher_than(e.clone()),
     };
-    pool.intern_version_set(cap, ranges)
+    let vsid = pool.intern_version_set(cap, ranges);
+    if dep.evr.is_some() {
+        vsdep.insert(vsid, dep.clone());
+    }
+    vsid
 }
 
 /// Build the resolvo provider.
@@ -73,10 +370,12 @@ fn version_set(pool: &Pool<Ranges<Evr>>, cap: NameId, dep: &Dep) -> VersionSetId
 /// solvable count bounded we only materialize capabilities that are actually
 /// required by something (`required`) — the vast majority of provides/files are
 /// never depended upon.
-fn build(
-    candidates: &[Candidate],
+fn build<S: CandidateSource + ?Sized>(
+    source: &S,
     installed_provides: &[(String, Option<Evr>)],
     required: &HashSet<String>,
+    include_recommends: bool,
+    providable: &HashSet<String>,
 ) -> RpmProvider {
     let pool = Pool::<Ranges<Evr>>::new();
     let mut providers: HashMap<NameId, Vec<SolvableId>> = HashMap::new();
@@ -84,47 +383,90 @@ fn build(
     let mut candidate_of: HashMap<SolvableId, usize> = HashMap::new();
     let mut installed: HashSet<SolvableId> = HashSet::new();
     let mut pkg_evr: HashMap<SolvableId, Evr> = HashMap::new();
+    let mut wildcard: HashSet<SolvableId> = HashSet::new();
+    let mut conditions: Vec<Condition> = Vec::new();
+    let mut vsdep: HashMap<VersionSetId, Dep> = HashMap::new();
+    // Installed capability names, for pre-evaluating rich `if`/`unless`.
+    let installed_names: HashSet<String> =
+        installed_provides.iter().map(|(n, _)| n.clone()).collect();
 
-    for (ci, c) in candidates.iter().enumerate() {
+    source.scan(required, &mut |c| {
+        let ci = c.id;
         // Build the package's requirements once; every provider solvable for
         // this package shares them, so selecting the package via *any*
         // capability pulls its dependencies.
-        let reqs: Vec<ConditionalRequirement> = c
-            .requires
-            .iter()
-            .filter(|r| !r.name.starts_with("rpmlib("))
-            .map(|r| {
-                let cap = pool.intern_package_name(r.name.clone());
-                ConditionalRequirement::from(version_set(&pool, cap, r))
-            })
-            .collect();
+        let mut reqs: Vec<ConditionalRequirement> = Vec::new();
+        // Hard requires, including rich/boolean deps (parsed into conditional
+        // requirements / unions).
+        for r in c.requires {
+            if is_ignorable_dep(&r.name) {
+                continue;
+            }
+            if richdep::is_rich(&r.name) {
+                if let Some(expr) = richdep::parse_rich(&r.name) {
+                    emit_rich(
+                        &pool,
+                        &mut conditions,
+                        &mut vsdep,
+                        &installed_names,
+                        &expr,
+                        None,
+                        &mut reqs,
+                    );
+                }
+                continue;
+            }
+            let cap = pool.intern_package_name(r.name.clone());
+            reqs.push(ConditionalRequirement::from(version_set(
+                &pool, &mut vsdep, cap, r,
+            )));
+        }
+        // Weak deps (Recommends): simple, providable ones, installed as if
+        // required (dnf default). Rich recommends are rare and skipped.
+        if include_recommends {
+            for r in c.recommends {
+                if is_ignorable_dep(&r.name) || richdep::is_rich(&r.name) {
+                    continue;
+                }
+                if providable.contains(&r.name) {
+                    let cap = pool.intern_package_name(r.name.clone());
+                    reqs.push(ConditionalRequirement::from(version_set(
+                        &pool, &mut vsdep, cap, r,
+                    )));
+                }
+            }
+        }
 
-        // Capabilities this package offers: its own name plus every Provides /
-        // file (the provided version, falling back to the package version).
-        let mut caps: Vec<(&str, Evr)> = Vec::with_capacity(c.provides.len() + 1);
-        caps.push((c.name.as_str(), c.evr.clone()));
-        for p in &c.provides {
-            caps.push((
-                p.name.as_str(),
-                p.evr.clone().unwrap_or_else(|| c.evr.clone()),
-            ));
+        // Capabilities this package offers: its own name (versioned, = package
+        // EVR) plus every Provides / file. A Provides with no version is
+        // unversioned and matches any require (tracked as a wildcard).
+        let mut caps: Vec<(&str, Option<&Evr>)> = Vec::with_capacity(c.provides.len() + 1);
+        caps.push((c.name, Some(&c.evr)));
+        for p in c.provides {
+            caps.push((p.name.as_str(), p.evr.as_ref()));
         }
 
         let mut done: HashSet<&str> = HashSet::new();
-        for (capname, rec) in caps {
+        for (capname, prov_evr) in caps {
             if !required.contains(capname) || !done.insert(capname) {
                 continue;
             }
             // One provider solvable per (package, capability), interned under
             // the capability name so all providers of a capability share it.
+            // The record is the provided version (or the package version as a
+            // placeholder for unversioned provides, which are flagged wildcard).
             let cap = pool.intern_package_name(capname.to_string());
+            let rec = prov_evr.cloned().unwrap_or_else(|| c.evr.clone());
             let sid = pool.intern_solvable(cap, rec);
             candidate_of.insert(sid, ci);
             pkg_evr.insert(sid, c.evr.clone());
             deps.insert(sid, reqs.clone());
+            if prov_evr.is_none() {
+                wildcard.insert(sid);
+            }
             providers.entry(cap).or_default().push(sid);
         }
-    }
+    });
 
     // Installed capabilities as preferred, dependency-free synthetic solvables
     // (only for capabilities that are required, and matching the same-name rule
@@ -139,6 +481,10 @@ fn build(
         installed.insert(sid);
         pkg_evr.insert(sid, rec);
         deps.insert(sid, Vec::new());
+        // An installed capability with no version (e.g. a file) matches any require.
+        if evr.is_none() {
+            wildcard.insert(sid);
+        }
         providers.entry(cap).or_default().push(sid);
     }
 
@@ -149,6 +495,9 @@ fn build(
         installed,
         candidate_of,
         pkg_evr,
+        wildcard,
+        conditions,
+        vsdep,
     }
 }
 
@@ -177,14 +526,12 @@ impl Interner for RpmProvider {
     }
     fn version_sets_in_union(
         &self,
-        _union: VersionSetUnionId,
+        union: VersionSetUnionId,
     ) -> impl Iterator<Item = VersionSetId> {
-        // We never construct version-set unions.
-        std::iter::empty()
+        self.pool.resolve_version_set_union(union)
     }
-    fn resolve_condition(&self, _condition: ConditionId) -> Condition {
-        // We never construct conditions.
-        unreachable!("rum does not use conditional requirements")
+    fn resolve_condition(&self, condition: ConditionId) -> Condition {
+        self.conditions[condition.as_u32() as usize].clone()
     }
 }
 
@@ -195,13 +542,26 @@ impl DependencyProvider for RpmProvider {
         version_set: VersionSetId,
         inverse: bool,
     ) -> Vec<SolvableId> {
-        let ranges = self.pool.resolve_version_set(version_set);
+        let dep = self.vsdep.get(&version_set);
         candidates
             .iter()
             .copied()
             .filter(|s| {
-                let evr = &self.pool.resolve_solvable(*s).record;
-                ranges.contains(evr) != inverse
+                // An unversioned provide (wildcard) matches any require (RPM's
+                // rpmdsCompare). For versioned requires, use the originating
+                // Dep's partial-EVR comparison (so `= 15.0.7` with no release
+                // matches `15.0.7-3.amzn2023.0.4`); this mirrors the greedy
+                // resolver and RPM exactly. Unversioned requires (no stored
+                // Dep) match on name alone, which membership already implies.
+                let matches = self.wildcard.contains(s)
+                    || match dep {
+                        Some(d) => {
+                            let rec = &self.pool.resolve_solvable(*s).record;
+                            d.satisfied_by(&d.name, Some(rec))
+                        }
+                        None => true,
+                    };
+                matches != inverse
             })
             .collect()
     }
@@ -245,38 +605,133 @@ pub fn resolve_sat(
     candidates: &[Candidate],
     installed_provides: &[(String, Option<Evr>)],
 ) -> Result<Resolved, ResolveError> {
-    // Resolve requested specs (name or name.arch) to package names up front.
-    let mut requested_names = Vec::new();
-    for spec in requested {
-        let name = candidates
-            .iter()
-            .find(|c| c.name == *spec || format!("{}.{}", c.name, c.arch) == *spec)
-            .map(|c| c.name.clone())
-            .ok_or_else(|| ResolveError::NotFound(spec.clone()))?;
-        if !requested_names.contains(&name) {
-            requested_names.push(name);
+    resolve_sat_with(requested, candidates, installed_provides)
+}
+
+/// Resolve against a [`CandidateSource`] (e.g. rum-repo's zero-copy views), so
+/// the full package set need never be materialized as owned `Candidate`s.
+pub fn resolve_sat_with<S: CandidateSource + ?Sized>(
+    requested: &[String],
+    source: &S,
+    installed_provides: &[(String, Option<Evr>)],
+) -> Result<Resolved, ResolveError> {
+    // Single cheap name-only pass gathering everything the pre-solve sets need:
+    // requested package names, the providable set, the hard-required capability
+    // names (incl. those named in rich exprs), and the raw recommend names.
+    // Walking full `Dep`s here (as the pool build does) is what dominated
+    // resolve time on large repos, so this pass stays in borrowed `&str`.
+    let mut requested_names: Vec<String> = Vec::new();
+    let mut found = vec![false; requested.len()];
+    let mut providable: HashSet<String> = HashSet::new();
+    let mut hard_required: HashSet<String> = HashSet::new();
+    let mut recommend_names: HashSet<String> = HashSet::new();
+    source.scan_names(&mut |c| {
+        for (i, spec) in requested.iter().enumerate() {
+            if !found[i] && (c.name == spec || format!("{}.{}", c.name, c.arch) == *spec) {
+                found[i] = true;
+                if !requested_names.iter().any(|n| n == c.name) {
+                    requested_names.push(c.name.to_string());
+                }
+            }
+        }
+        // Providable: package names + non-file provides (files never back a
+        // weak dep and would balloon this set on RHEL-scale metadata).
+        providable.insert(c.name.to_string());
+        for p in c.provide_names {
+            if !p.starts_with('/') {
+                providable.insert(p.to_string());
+            }
+        }
+        for r in c.require_names {
+            if is_ignorable_dep(r) {
+                continue;
+            }
+            if richdep::is_rich(r) {
+                if let Some(expr) = richdep::parse_rich(r) {
+                    collect_rich_names(&expr, &mut hard_required);
+                }
+                continue;
+            }
+            hard_required.insert(r.to_string());
+        }
+        for r in c.recommend_names {
+            if !is_ignorable_dep(r) && !richdep::is_rich(r) {
+                recommend_names.insert(r.to_string());
+            }
+        }
+    });
+    for (i, spec) in requested.iter().enumerate() {
+        if !found[i] {
+            return Err(ResolveError::NotFound(spec.clone()));
         }
     }
+    for (name, _) in installed_provides {
+        providable.insert(name.clone());
+    }
 
-    // The set of capabilities we must materialize: everything required by any
-    // candidate, plus the requested package names themselves.
-    let mut required: HashSet<String> = HashSet::new();
-    for c in candidates {
-        for r in &c.requires {
-            if !r.name.starts_with("rpmlib(") {
-                required.insert(r.name.clone());
+    // Try with weak dependencies (dnf's default); if that makes the set
+    // unsolvable, retry hard-only so weak deps never cause a failure.
+    match attempt(
+        requested,
+        &requested_names,
+        source,
+        installed_provides,
+        &providable,
+        &hard_required,
+        &recommend_names,
+        true,
+    ) {
+        Err(ResolveError::Unsatisfied { .. }) => attempt(
+            requested,
+            &requested_names,
+            source,
+            installed_provides,
+            &providable,
+            &hard_required,
+            &recommend_names,
+            false,
+        ),
+        other => other,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn attempt<S: CandidateSource + ?Sized>(
+    requested: &[String],
+    requested_names: &[String],
+    source: &S,
+    installed_provides: &[(String, Option<Evr>)],
+    providable: &HashSet<String>,
+    hard_required: &HashSet<String>,
+    recommend_names: &HashSet<String>,
+    include_recommends: bool,
+) -> Result<Resolved, ResolveError> {
+    // Capabilities to materialize: everything hard-required, the requested
+    // names, and (when on) the satisfiable Recommends. Assembled from the
+    // pre-pass sets — no extra scan.
+    let mut required: HashSet<String> = hard_required.clone();
+    for n in requested_names {
+        required.insert(n.clone());
+    }
+    if include_recommends {
+        for r in recommend_names {
+            if providable.contains(r) {
+                required.insert(r.clone());
             }
         }
     }
-    for n in &requested_names {
-        required.insert(n.clone());
-    }
 
-    let provider = build(candidates, installed_provides, &required);
+    let provider = build(
+        source,
+        installed_provides,
+        &required,
+        include_recommends,
+        providable,
+    );
 
     // Root requirements: each requested package, at any version.
     let mut root = Vec::new();
-    for name in &requested_names {
+    for name in requested_names {
         let cap = provider.pool.intern_package_name(name.clone());
         let vs = provider.pool.intern_version_set(cap, Ranges::full());
         root.push(ConditionalRequirement::from(vs));
@@ -330,6 +785,7 @@ mod tests {
             evr: Evr::new(Some(0), ver, "1"),
             provides: provides.iter().map(|p| Dep::unversioned(*p)).collect(),
             requires: requires.to_vec(),
+            recommends: Vec::new(),
         }
     }
 
@@ -376,6 +832,162 @@ mod tests {
         assert!(r.contains(&0), "app selected");
         assert!(r.contains(&1), "fell back to prov-1.0");
         assert!(!r.contains(&2), "prov-2.0 (dead end) not selected");
+    }
+
+    #[test]
+    fn unversioned_provide_satisfies_versioned_require() {
+        // RPM rule: a versionless `Provides: webserver` satisfies
+        // `Requires: webserver >= 5.0`, even though the package is v3.0.
+        let app = Candidate {
+            id: 0,
+            name: "app".into(),
+            arch: "x86_64".into(),
+            evr: Evr::new(Some(0), "1", "1"),
+            provides: vec![],
+            requires: vec![Dep {
+                name: "webserver".into(),
+                flag: DepFlag::Ge,
+                evr: Some(Evr::new(Some(0), "5.0", "")),
+            }],
+            recommends: vec![],
+        };
+        let prov = Candidate {
+            id: 1,
+            name: "prov".into(),
+            arch: "x86_64".into(),
+            evr: Evr::new(Some(0), "3.0", "1"), // package older than the require
+            provides: vec![Dep::unversioned("webserver")], // unversioned provide
+            requires: vec![],
+            recommends: vec![],
+        };
+        let r = resolve_sat(&["app".into()], &[app, prov], &[])
+            .unwrap()
+            .to_install;
+        assert!(
+            r.contains(&1),
+            "unversioned provide must satisfy a versioned require"
+        );
+    }
+
+    #[test]
+    fn version_locked_arch_qualified_eq_requires() {
+        // Reproduces the deep -devel pattern (clang-devel, postgresql*-devel):
+        // a package with EQ requires on ARCH-QUALIFIED capabilities that other
+        // packages provide versioned, all pinned to one version.
+        let evr = |v: &str| Evr::new(Some(0), v, "1");
+        let vprov = |name: &str, v: &str| Dep {
+            name: name.into(),
+            flag: DepFlag::Eq,
+            evr: Some(evr(v)),
+        };
+        // app Requires: lib(x86-64) = 1.0 AND tool(x86-64) = 1.0
+        let app = Candidate {
+            id: 0,
+            name: "app".into(),
+            arch: "x86_64".into(),
+            evr: evr("1.0"),
+            provides: vec![],
+            requires: vec![vprov("lib(x86-64)", "1.0"), vprov("tool(x86-64)", "1.0")],
+            recommends: vec![],
+        };
+        // lib and tool each carry a versioned arch-qualified provide.
+        let lib = Candidate {
+            id: 1,
+            name: "lib".into(),
+            arch: "x86_64".into(),
+            evr: evr("1.0"),
+            provides: vec![vprov("lib(x86-64)", "1.0")],
+            requires: vec![],
+            recommends: vec![],
+        };
+        let tool = Candidate {
+            id: 2,
+            name: "tool".into(),
+            arch: "x86_64".into(),
+            evr: evr("1.0"),
+            provides: vec![vprov("tool(x86-64)", "1.0")],
+            requires: vec![],
+            recommends: vec![],
+        };
+        let r = resolve_sat(&["app".into()], &[app, lib, tool], &[])
+            .unwrap()
+            .to_install;
+        assert!(
+            r.contains(&1) && r.contains(&2),
+            "arch-qualified EQ provides must resolve"
+        );
+    }
+
+    #[test]
+    fn rich_if_pulls_dep_when_condition_installed() {
+        // app Requires: (extra if trigger). Mirrors mariadb's
+        // (mysql-selinux if selinux-policy-targeted).
+        let mut app = cand(0, "app", "1.0", &[], &[]);
+        app.requires = vec![Dep::unversioned("(extra if trigger)")];
+        let extra = cand(1, "extra", "1.0", &["extra"], &[]);
+
+        // trigger installed -> extra should be pulled.
+        let installed = vec![("trigger".to_string(), None)];
+        let r = resolve_sat(&["app".into()], &[app.clone(), extra.clone()], &installed)
+            .unwrap()
+            .to_install;
+        assert!(r.contains(&1), "extra pulled because trigger is installed");
+
+        // trigger absent -> extra not pulled (condition false).
+        let r2 = resolve_sat(&["app".into()], &[app, extra], &[])
+            .unwrap()
+            .to_install;
+        assert!(!r2.contains(&1), "extra not pulled when trigger absent");
+    }
+
+    #[test]
+    fn rich_or_resolves_via_either_provider() {
+        let mut app = cand(0, "app", "1.0", &[], &[]);
+        app.requires = vec![Dep::unversioned("(webA or webB)")];
+        let weba = cand(1, "webA", "1.0", &["webA"], &[]);
+        let r = resolve_sat(&["app".into()], &[app, weba], &[])
+            .unwrap()
+            .to_install;
+        assert!(r.contains(&1), "OR satisfied by the available provider");
+    }
+
+    #[test]
+    fn eq_require_without_release_matches_any_release() {
+        // Reproduces the clang-libs gap: `Requires: cap = 15.0.7` (no release)
+        // must match a provider advertising `cap = 15.0.7-3.amzn2023.0.4`.
+        let app = Candidate {
+            id: 0,
+            name: "app".into(),
+            arch: "x86_64".into(),
+            evr: Evr::new(Some(0), "1.0", "1"),
+            provides: vec![],
+            requires: vec![Dep {
+                name: "cap".into(),
+                flag: DepFlag::Eq,
+                evr: Some(Evr::new(Some(0), "15.0.7", "")), // version only, no release
+            }],
+            recommends: vec![],
+        };
+        let prov = Candidate {
+            id: 1,
+            name: "prov".into(),
+            arch: "x86_64".into(),
+            evr: Evr::new(Some(0), "15.0.7", "3.amzn2023.0.4"),
+            provides: vec![Dep {
+                name: "cap".into(),
+                flag: DepFlag::Eq,
+                evr: Some(Evr::new(Some(0), "15.0.7", "3.amzn2023.0.4")),
+            }],
+            requires: vec![],
+            recommends: vec![],
+        };
+        let r = resolve_sat(&["app".into()], &[app, prov], &[])
+            .unwrap()
+            .to_install;
+        assert!(
+            r.contains(&1),
+            "EQ without release must match any release of that version"
+        );
     }
 
     #[test]
