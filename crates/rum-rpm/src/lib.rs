@@ -139,6 +139,9 @@ mod imp {
             unsafe {
                 let root = CString::new("/").unwrap();
                 ffi::rpmtsSetRootDir(ts, root.as_ptr());
+                // Open the rpmdb read-only (O_RDONLY = 0) so rum never takes a
+                // write lock — reads won't block or fail while dnf/yum runs.
+                ffi::rpmtsOpenDB(ts, 0);
             }
             Ok(Rpmdb { ts })
         }

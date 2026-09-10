@@ -48,6 +48,9 @@ extern "C" {
     pub fn rpmtsCreate() -> rpmts;
     pub fn rpmtsFree(ts: rpmts) -> rpmts;
     pub fn rpmtsSetRootDir(ts: rpmts, root_dir: *const c_char) -> c_int;
+    /// Open the rpmdb with an explicit mode (O_RDONLY = 0). Opening read-only
+    /// means rum never takes a write lock and won't block/fail while dnf runs.
+    pub fn rpmtsOpenDB(ts: rpmts, dbmode: c_int) -> c_int;
 
     /// Create a database iterator. `keyp`/`keylen` may be NULL/0 to match all.
     /// For string keys, keylen 0 means "use strlen".
