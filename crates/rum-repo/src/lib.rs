@@ -16,6 +16,7 @@ mod checksum;
 mod decompress;
 mod filelists;
 mod http;
+mod interned;
 mod primary;
 mod repomd;
 
@@ -24,6 +25,7 @@ use std::time::{Duration, SystemTime};
 
 pub use checksum::{Checksum, ChecksumKind};
 pub use http::{detect_aws_region, Http};
+pub use interned::PkgView;
 pub use primary::AvailablePackage;
 pub use repomd::{RepoMd, RepoMdData};
 
@@ -59,10 +61,7 @@ pub enum RepoError {
     },
 }
 
-use primary::ArchivedAvailablePackage;
-
-/// The rkyv-archived root of the parsed-metadata cache: the list of packages.
-type ArchivedPkgs = rkyv::vec::ArchivedVec<ArchivedAvailablePackage>;
+use interned::ArchivedStore;
 
 /// Backing store for a repo's rkyv cache bytes: an mmap of `primary.rkyv` on the
 /// warm path (page-aligned, never fully read into the heap — important on tiny
@@ -84,9 +83,9 @@ impl std::ops::Deref for MetaBytes {
 
 /// The parsed metadata for one repository after a sync.
 ///
-/// The packages are held as rkyv-archived bytes (mmap or owned) rather than a
-/// deserialized `Vec`. Query commands read them zero-copy via [`Self::packages`]
-/// (no per-package allocation); the resolve/download path materializes owned
+/// Held as the rkyv-archived interned [`interned::Store`] (mmap or owned bytes).
+/// Query commands read `&str` views zero-copy via [`Self::views`] (no
+/// per-package allocation); the resolve/download path materializes owned
 /// packages via [`Self::to_owned_packages`].
 pub struct RepoMetadata {
     pub repo_id: String,
@@ -109,7 +108,7 @@ impl RepoMetadata {
         from_cache: bool,
         base_url: String,
     ) -> Result<Self, RepoError> {
-        let archived = rkyv::access::<ArchivedPkgs, rkyv::rancor::Error>(&bytes)
+        let archived = rkyv::access::<ArchivedStore, rkyv::rancor::Error>(&bytes)
             .map_err(|e| RepoError::Xml(format!("corrupt metadata cache: {e}")))?;
         let len = archived.len();
         Ok(RepoMetadata {
@@ -121,18 +120,22 @@ impl RepoMetadata {
         })
     }
 
-    /// Zero-copy view of the archived packages (no allocation).
-    pub fn packages(&self) -> &ArchivedPkgs {
+    /// The archived interned store backing this repo.
+    fn store(&self) -> &ArchivedStore {
         // SAFETY: `bytes` was validated by `rkyv::access` in `from_bytes` and is
         // immutable for the lifetime of `self`, so unchecked access is sound.
-        unsafe { rkyv::access_unchecked::<ArchivedPkgs>(&self.bytes) }
+        unsafe { rkyv::access_unchecked::<ArchivedStore>(&self.bytes) }
+    }
+
+    /// Zero-copy `&str` views over the packages (query commands).
+    pub fn views(&self) -> impl Iterator<Item = PkgView<'_>> {
+        self.store().views()
     }
 
     /// Materialize owned packages (used by the resolve/download path, which
-    /// mutates and indexes them). Costs a full deserialize, as before.
+    /// mutates and indexes them).
     pub fn to_owned_packages(&self) -> Vec<AvailablePackage> {
-        rkyv::from_bytes::<Vec<AvailablePackage>, rkyv::rancor::Error>(&self.bytes)
-            .unwrap_or_default()
+        self.store().to_owned_packages()
     }
 
     pub fn len(&self) -> usize {
@@ -255,15 +258,15 @@ pub fn sync_repo(repo: &Repo, opts: &SyncOptions) -> Result<RepoMetadata, RepoEr
         primary::parse_reader(plain, &repo.id)?
     };
     let _ = std::fs::remove_file(&download_tmp);
-    tracing::info!(repo = %repo.id, count = packages.len(), %base, "refreshed metadata");
+    tracing::info!(repo = %repo.id, count = packages.packages.len(), %base, "refreshed metadata");
 
-    // Persist to cache: repomd.xml (freshness anchor) plus the parsed packages
+    // Persist to cache: repomd.xml (freshness anchor) plus the interned store
     // serialized with rkyv to primary.rkyv (written last, so a present parsed
     // cache always has a matching repomd.xml governing its freshness).
     let encoded = rkyv::to_bytes::<rkyv::rancor::Error>(&packages)
         .map_err(|e| RepoError::Xml(format!("failed to serialize metadata cache: {e}")))?;
-    // Drop the parsed packages before writing/mapping so we don't hold the Vec
-    // and the serialized buffer at once.
+    // Drop the interned store before writing/mapping so we don't hold it and the
+    // serialized buffer at once.
     drop(packages);
     write_cache(&dir, &repomd_path, &repomd_bytes, &primary_cache, &encoded)?;
     let _ = std::fs::write(&baseurl_path, &base);

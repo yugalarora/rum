@@ -17,7 +17,7 @@ mod vercmp;
 
 use std::cmp::Ordering;
 
-pub use dep::{Dep, DepFlag};
+pub use dep::{ArchivedDepFlag, Dep, DepFlag};
 pub use resolve::{resolve, Candidate, ResolveError, Resolved};
 pub use sat::resolve_sat;
 pub use vercmp::rpmvercmp;

@@ -16,10 +16,10 @@ pub fn run(terms: &[String]) -> anyhow::Result<()> {
     let mut hits: Vec<(String, String)> = Vec::new();
     let mut seen = BTreeSet::new();
     for m in synced.metas() {
-        for p in m.packages().iter() {
-            let hay = format!("{} {}", p.name, p.summary).to_lowercase();
+        for p in m.views() {
+            let hay = format!("{} {}", p.name(), p.summary()).to_lowercase();
             if needles.iter().all(|n| hay.contains(n)) && seen.insert(p.name_arch()) {
-                hits.push((p.name_arch(), p.summary.to_string()));
+                hits.push((p.name_arch(), p.summary().to_string()));
             }
         }
     }

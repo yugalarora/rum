@@ -63,7 +63,7 @@ pub fn installed_best() -> HashMap<String, Evr> {
 pub fn available_best(metas: &[RepoMetadata]) -> HashMap<String, AvailRow> {
     let mut map: HashMap<String, AvailRow> = HashMap::new();
     for m in metas {
-        for p in m.packages().iter() {
+        for p in m.views() {
             let key = p.name_arch();
             let evr = p.evr_cmp();
             match map.get(&key) {
@@ -72,12 +72,12 @@ pub fn available_best(metas: &[RepoMetadata]) -> HashMap<String, AvailRow> {
                     map.insert(
                         key,
                         AvailRow {
-                            name: p.name.to_string(),
-                            arch: p.arch.to_string(),
+                            name: p.name().to_string(),
+                            arch: p.arch().to_string(),
                             epoch: p.epoch(),
-                            version: p.version.to_string(),
-                            release: p.release.to_string(),
-                            repo_id: p.repo_id.to_string(),
+                            version: p.version().to_string(),
+                            release: p.release().to_string(),
+                            repo_id: p.repo_id().to_string(),
                         },
                     );
                 }
