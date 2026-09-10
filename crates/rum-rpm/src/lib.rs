@@ -21,6 +21,12 @@ pub enum RpmError {
     TsCreate,
     #[error("librpm is not available on this platform (built without Linux librpm)")]
     Unsupported,
+    #[error("cannot read package {path}: {reason}")]
+    PackageRead { path: String, reason: String },
+    #[error("nothing to remove: {0} is not installed")]
+    NotInstalled(String),
+    #[error("rpm transaction failed:\n{0}")]
+    TransactionFailed(String),
 }
 
 /// One installed package, as read from the rpmdb.
@@ -65,11 +71,27 @@ pub struct Rpmdb {
     ts: ffi::rpmts,
 }
 
+/// A read-write librpm transaction: install and/or erase elements, then commit
+/// natively via `rpmtsRun` (rpm does its own dependency check, ordering, and
+/// scriptlet execution, writing the rpmdb). This is the native replacement for
+/// shelling out to `rpm -U` / `rpm -e`.
+pub struct Transaction {
+    #[cfg(target_os = "linux")]
+    ts: ffi::rpmts,
+    /// Owned copies of the install-file paths; their pointers are handed to
+    /// librpm as element keys and must outlive the transaction run.
+    #[cfg(target_os = "linux")]
+    keys: Vec<std::ffi::CString>,
+    /// Number of elements added, so callers can detect an empty transaction.
+    count: usize,
+}
+
 #[cfg(target_os = "linux")]
 mod imp {
-    use super::{ffi, Package, RpmError, Rpmdb};
+    use super::{ffi, Package, RpmError, Rpmdb, Transaction};
     use std::ffi::{CStr, CString};
-    use std::os::raw::c_void;
+    use std::os::raw::{c_uint, c_void};
+    use std::path::Path;
     use std::ptr;
     use std::sync::Once;
 
@@ -399,6 +421,264 @@ mod imp {
             }
         }
     }
+
+    /// State threaded through the install callback: the FD of the package
+    /// currently being unpacked (opened on INST_OPEN_FILE, closed on
+    /// INST_CLOSE_FILE).
+    struct CbState {
+        cur_fd: ffi::FD_t,
+    }
+
+    /// librpm hands us `key` (the path pointer we set on each install element)
+    /// when it needs the package's file descriptor during unpacking. We Fopen
+    /// it and return the FD; on close we Fclose it. All other events are
+    /// ignored (rpm still logs its own progress/scriptlet output to stderr).
+    extern "C" fn notify_cb(
+        _h: *const c_void,
+        what: c_uint,
+        _amount: u64,
+        _total: u64,
+        key: *const c_void,
+        data: *mut c_void,
+    ) -> *mut c_void {
+        // SAFETY: `data` is the &mut CbState we passed to rpmtsSetNotifyCallback,
+        // valid for the whole run; librpm calls back single-threaded.
+        let state = unsafe { &mut *(data as *mut CbState) };
+        match what {
+            ffi::RPMCALLBACK_INST_OPEN_FILE => {
+                if key.is_null() {
+                    return ptr::null_mut();
+                }
+                let mode = c"r.ufdio";
+                // SAFETY: key is the CString path pointer from add_install.
+                let fd = unsafe { ffi::Fopen(key as *const _, mode.as_ptr()) };
+                state.cur_fd = fd;
+                fd as *mut c_void
+            }
+            ffi::RPMCALLBACK_INST_CLOSE_FILE => {
+                if !state.cur_fd.is_null() {
+                    // SAFETY: cur_fd was returned by Fopen above.
+                    unsafe { ffi::Fclose(state.cur_fd) };
+                    state.cur_fd = ptr::null_mut();
+                }
+                ptr::null_mut()
+            }
+            _ => ptr::null_mut(),
+        }
+    }
+
+    impl Transaction {
+        /// Create an empty read-write transaction rooted at `/`.
+        pub fn new() -> Result<Self, RpmError> {
+            ensure_config()?;
+            // SAFETY: rpmtsCreate returns an owned transaction set or null.
+            let ts = unsafe { ffi::rpmtsCreate() };
+            if ts.is_null() {
+                return Err(RpmError::TsCreate);
+            }
+            // SAFETY: ts is non-null. We do NOT open the db read-only here (as
+            // Rpmdb does) so rpmtsRun can open it read-write to commit.
+            unsafe {
+                let root = CString::new("/").unwrap();
+                ffi::rpmtsSetRootDir(ts, root.as_ptr());
+            }
+            Ok(Transaction {
+                ts,
+                keys: Vec::new(),
+                count: 0,
+            })
+        }
+
+        /// Queue an install/upgrade of the RPM at `path`.
+        pub fn add_install(&mut self, path: &Path) -> Result<(), RpmError> {
+            let path_str = path.to_string_lossy().into_owned();
+            let cpath = CString::new(path_str.clone()).map_err(|_| RpmError::PackageRead {
+                path: path_str.clone(),
+                reason: "path contains NUL".into(),
+            })?;
+            let mode = c"r.ufdio";
+
+            // SAFETY: valid ts; Fopen/rpmReadPackageFile/AddInstallElement per
+            // the librpm install recipe. The header is freed after being added
+            // (AddInstallElement takes its own reference).
+            unsafe {
+                let fd = ffi::Fopen(cpath.as_ptr(), mode.as_ptr());
+                if fd.is_null() {
+                    return Err(RpmError::PackageRead {
+                        path: path_str,
+                        reason: "cannot open file".into(),
+                    });
+                }
+                let mut h: ffi::Header = ptr::null_mut();
+                let rc = ffi::rpmReadPackageFile(self.ts, fd, cpath.as_ptr(), &mut h);
+                ffi::Fclose(fd);
+                match rc {
+                    ffi::RPMRC_OK => {}
+                    ffi::RPMRC_NOTTRUSTED | ffi::RPMRC_NOKEY => {
+                        tracing::warn!(path = %path_str, "package signature not trusted / key missing");
+                    }
+                    _ => {
+                        if !h.is_null() {
+                            ffi::headerFree(h);
+                        }
+                        return Err(RpmError::PackageRead {
+                            path: path_str,
+                            reason: format!("rpmReadPackageFile failed (rc={rc})"),
+                        });
+                    }
+                }
+                if h.is_null() {
+                    return Err(RpmError::PackageRead {
+                        path: path_str,
+                        reason: "no header".into(),
+                    });
+                }
+
+                // Keep the path CString alive; its pointer is the element key
+                // handed back to the notify callback.
+                self.keys.push(cpath);
+                let key = self.keys.last().unwrap().as_ptr() as *const c_void;
+                let added = ffi::rpmtsAddInstallElement(self.ts, h, key, 1, ptr::null_mut());
+                ffi::headerFree(h);
+                if added != 0 {
+                    self.keys.pop();
+                    return Err(RpmError::PackageRead {
+                        path: path_str,
+                        reason: "rpmtsAddInstallElement failed".into(),
+                    });
+                }
+            }
+            self.count += 1;
+            Ok(())
+        }
+
+        /// Queue erasure of every installed package with the exact name `name`.
+        pub fn add_erase(&mut self, name: &str) -> Result<(), RpmError> {
+            let key = CString::new(name).map_err(|_| RpmError::NotInstalled(name.into()))?;
+            let mut any = false;
+            // SAFETY: valid ts; iterate installed headers matching the name and
+            // add an erase element for each (dboffset -1, unused by modern rpm).
+            unsafe {
+                let mi = ffi::rpmtsInitIterator(
+                    self.ts,
+                    ffi::RPMTAG_NAME,
+                    key.as_ptr() as *const c_void,
+                    0,
+                );
+                if !mi.is_null() {
+                    loop {
+                        let h = ffi::rpmdbNextIterator(mi);
+                        if h.is_null() {
+                            break;
+                        }
+                        if ffi::rpmtsAddEraseElement(self.ts, h, -1) == 0 {
+                            any = true;
+                            self.count += 1;
+                        }
+                    }
+                    ffi::rpmdbFreeIterator(mi);
+                }
+            }
+            if any {
+                Ok(())
+            } else {
+                Err(RpmError::NotInstalled(name.into()))
+            }
+        }
+
+        pub fn is_empty(&self) -> bool {
+            self.count == 0
+        }
+
+        /// Commit (or, with `test`, dry-run) the transaction: dependency check,
+        /// order, then run. Returns an error carrying rpm's problem strings on
+        /// failure.
+        pub fn run(&mut self, test: bool) -> Result<(), RpmError> {
+            let mut state = CbState {
+                cur_fd: ptr::null_mut(),
+            };
+            // SAFETY: valid ts; standard check/order/run sequence. The callback
+            // data pointer is valid for the duration of rpmtsRun.
+            unsafe {
+                let flags = if test {
+                    ffi::RPMTRANS_FLAG_TEST
+                } else {
+                    ffi::RPMTRANS_FLAG_NONE
+                };
+                ffi::rpmtsSetFlags(self.ts, flags);
+                ffi::rpmtsSetNotifyCallback(
+                    self.ts,
+                    notify_cb,
+                    &mut state as *mut CbState as *mut c_void,
+                );
+
+                if ffi::rpmtsCheck(self.ts) != 0 {
+                    return Err(RpmError::TransactionFailed(self.problems()));
+                }
+                // rpmtsOrder returns the count of elements it could not order.
+                if ffi::rpmtsOrder(self.ts) != 0 {
+                    return Err(RpmError::TransactionFailed(
+                        "could not order transaction (dependency loop?)".into(),
+                    ));
+                }
+                let rc = ffi::rpmtsRun(self.ts, ptr::null_mut(), ffi::RPMPROB_FILTER_NONE);
+                if rc != 0 {
+                    let probs = self.problems();
+                    let msg = if probs.is_empty() {
+                        format!("rpmtsRun returned {rc}")
+                    } else {
+                        probs
+                    };
+                    return Err(RpmError::TransactionFailed(msg));
+                }
+            }
+            Ok(())
+        }
+
+        /// Collect rpm's current problem set into a newline-joined string.
+        fn problems(&self) -> String {
+            let mut out = String::new();
+            // SAFETY: valid ts; iterate the problem set, copying each string.
+            unsafe {
+                let ps = ffi::rpmtsProblems(self.ts);
+                if ps.is_null() {
+                    return out;
+                }
+                let psi = ffi::rpmpsInitIterator(ps);
+                if !psi.is_null() {
+                    while ffi::rpmpsiNext(psi) >= 0 {
+                        let prob = ffi::rpmpsGetProblem(psi);
+                        if prob.is_null() {
+                            continue;
+                        }
+                        let s = ffi::rpmProblemString(prob);
+                        if !s.is_null() {
+                            let msg = CStr::from_ptr(s).to_string_lossy().into_owned();
+                            if !out.is_empty() {
+                                out.push('\n');
+                            }
+                            out.push_str("  ");
+                            out.push_str(&msg);
+                            // rpmProblemString malloc's; the process exits soon,
+                            // so a small leak here is acceptable.
+                        }
+                    }
+                    ffi::rpmpsFreeIterator(psi);
+                }
+                ffi::rpmpsFree(ps);
+            }
+            out
+        }
+    }
+
+    impl Drop for Transaction {
+        fn drop(&mut self) {
+            // SAFETY: ts was created by rpmtsCreate and not freed elsewhere.
+            unsafe {
+                ffi::rpmtsFree(self.ts);
+            }
+        }
+    }
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -423,6 +703,25 @@ impl Rpmdb {
     }
     pub fn all_provides(&self) -> Vec<(String, Option<String>)> {
         Vec::new()
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+impl Transaction {
+    pub fn new() -> Result<Self, RpmError> {
+        Err(RpmError::Unsupported)
+    }
+    pub fn add_install(&mut self, _path: &std::path::Path) -> Result<(), RpmError> {
+        Err(RpmError::Unsupported)
+    }
+    pub fn add_erase(&mut self, _name: &str) -> Result<(), RpmError> {
+        Err(RpmError::Unsupported)
+    }
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+    pub fn run(&mut self, _test: bool) -> Result<(), RpmError> {
+        Err(RpmError::Unsupported)
     }
 }
 

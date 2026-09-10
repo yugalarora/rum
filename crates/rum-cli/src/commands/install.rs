@@ -1,18 +1,18 @@
 //! `rum install [-y] <packages...>`
 //!
 //! Resolves the dependency closure, downloads the RPMs (checksum-verified),
-//! shows the transaction, and commits it via the system `rpm` (which is
-//! librpm) in a single transaction. rpm performs its own dependency/conflict
-//! check (`rpmtsCheck`) and ordering before writing the rpmdb, so a resolver
-//! mistake fails cleanly rather than corrupting the system.
-//!
-//! (A native librpm `rpmtsRun` FFI path is a planned hardening follow-up; the
-//! rpm binary is used here for a battle-tested transaction engine.)
+//! shows the transaction, and commits it. When rum runs as root it commits
+//! natively through librpm (`rpmtsRun`) via [`rum_rpm::Transaction`]; otherwise
+//! (or when `RUM_USE_RPM_BINARY=1`) it shells out to `sudo rpm -U`. Either way
+//! rpm performs its own dependency/conflict check and ordering before writing
+//! the rpmdb, so a resolver mistake fails cleanly rather than corrupting the
+//! system.
 
 use std::path::PathBuf;
 
 use super::{confirm, download};
 use crate::sys;
+use rum_rpm::Transaction;
 
 pub fn run(packages: &[String], assume_yes: bool) -> anyhow::Result<()> {
     if packages.is_empty() {
@@ -46,8 +46,30 @@ pub fn run(packages: &[String], assume_yes: bool) -> anyhow::Result<()> {
 }
 
 fn commit_install(files: &[PathBuf]) -> anyhow::Result<()> {
-    // `rpm -U` installs new packages and upgrades existing ones, in one
-    // ordered transaction with scriptlets. `-h` shows a progress hash.
+    let use_binary = std::env::var_os("RUM_USE_RPM_BINARY").is_some();
+    if sys::is_root() && !use_binary {
+        commit_install_native(files)
+    } else {
+        commit_install_rpm_binary(files)
+    }
+}
+
+/// Commit natively through librpm (`rpmtsRun`), no subprocess. Requires root.
+fn commit_install_native(files: &[PathBuf]) -> anyhow::Result<()> {
+    let mut tx = Transaction::new().map_err(|e| anyhow::anyhow!("cannot start transaction: {e}"))?;
+    for f in files {
+        tx.add_install(f)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
+    tx.run(false).map_err(|e| anyhow::anyhow!("{e}"))?;
+    println!("Complete!");
+    Ok(())
+}
+
+/// Fallback path: `sudo rpm -Uvh` (used when rum is not root, or when
+/// `RUM_USE_RPM_BINARY` is set). `-U` installs new and upgrades existing, in one
+/// ordered transaction with scriptlets; `-h` shows a progress hash.
+fn commit_install_rpm_binary(files: &[PathBuf]) -> anyhow::Result<()> {
     let mut cmd = sys::privileged("rpm");
     cmd.arg("-Uvh");
     for f in files {

@@ -1,12 +1,13 @@
 //! `rum remove [-y] <packages...>`
 //!
-//! Erases packages via the system `rpm` (librpm). rpm refuses to remove a
-//! package that others still depend on (unless forced), so this is safe by
-//! default. We show what will be removed, confirm, then run `rpm -e`.
+//! Erases packages. rpm refuses to remove a package that others still depend
+//! on (unless forced), so this is safe by default. We show what will be
+//! removed, confirm, then commit: natively through librpm (`rpmtsRun`) when rum
+//! runs as root, else via `sudo rpm -e` (also when `RUM_USE_RPM_BINARY=1`).
 
 use super::confirm;
 use crate::sys;
-use rum_rpm::Rpmdb;
+use rum_rpm::{Rpmdb, Transaction};
 
 pub fn run(packages: &[String], assume_yes: bool) -> anyhow::Result<()> {
     if packages.is_empty() {
@@ -42,6 +43,27 @@ pub fn run(packages: &[String], assume_yes: bool) -> anyhow::Result<()> {
         return Ok(());
     }
 
+    let use_binary = std::env::var_os("RUM_USE_RPM_BINARY").is_some();
+    if sys::is_root() && !use_binary {
+        commit_remove_native(packages)
+    } else {
+        commit_remove_rpm_binary(packages)
+    }
+}
+
+/// Erase natively through librpm (`rpmtsRun`). Requires root.
+fn commit_remove_native(packages: &[String]) -> anyhow::Result<()> {
+    let mut tx = Transaction::new().map_err(|e| anyhow::anyhow!("cannot start transaction: {e}"))?;
+    for p in packages {
+        tx.add_erase(p).map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
+    tx.run(false).map_err(|e| anyhow::anyhow!("{e}"))?;
+    println!("Complete!");
+    Ok(())
+}
+
+/// Fallback path: `sudo rpm -e` (not root, or `RUM_USE_RPM_BINARY`).
+fn commit_remove_rpm_binary(packages: &[String]) -> anyhow::Result<()> {
     let mut cmd = sys::privileged("rpm");
     cmd.arg("-e");
     for p in packages {
