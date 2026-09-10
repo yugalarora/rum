@@ -7,6 +7,7 @@ use crate::Evr;
 
 /// The comparison operator on a versioned dependency (RPM's sense flags).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum DepFlag {
     /// Unversioned: any version satisfies.
     Any,
@@ -33,6 +34,7 @@ impl DepFlag {
 
 /// A dependency capability (name [op evr]).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct Dep {
     pub name: String,
     pub flag: DepFlag,

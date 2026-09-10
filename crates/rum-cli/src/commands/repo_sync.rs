@@ -3,13 +3,16 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
-use rum_repo::{AvailablePackage, Http, SyncOptions};
+use rum_repo::{AvailablePackage, Http, RepoMetadata, SyncOptions};
 
 use crate::sys;
 
 /// Result of syncing every enabled repo.
 pub struct Synced {
-    pub packages: Vec<AvailablePackage>,
+    /// Parsed metadata per successful repo. Packages are held rkyv-archived;
+    /// read them zero-copy via [`Synced::metas`] (query commands) or
+    /// materialize owned packages via [`Synced::owned_packages`] (resolve).
+    metas: Vec<RepoMetadata>,
     /// Per-repo (id, count, from_cache) for reporting.
     pub repos: Vec<RepoStat>,
     /// repo id -> resolved base URL (for building package download URLs).
@@ -18,6 +21,23 @@ pub struct Synced {
     /// downloading packages, e.g. from mutual-TLS RHUI repos).
     pub clients: HashMap<String, Http>,
     pub elapsed: std::time::Duration,
+}
+
+impl Synced {
+    /// Zero-copy view of every synced repo's archived packages.
+    pub fn metas(&self) -> &[RepoMetadata] {
+        &self.metas
+    }
+
+    /// Materialize all packages, aggregated across repos, as owned values.
+    /// Used by the resolve/download path (which indexes and mutates them).
+    pub fn owned_packages(&self) -> Vec<AvailablePackage> {
+        let mut v = Vec::new();
+        for m in &self.metas {
+            v.extend(m.to_owned_packages());
+        }
+        v
+    }
 }
 
 pub struct RepoStat {
@@ -53,20 +73,20 @@ pub fn sync_enabled(force_refresh: bool) -> anyhow::Result<Synced> {
     let results = rum_repo::sync_all(&enabled, &opts);
     let elapsed = start.elapsed();
 
-    let mut packages = Vec::new();
+    let mut metas = Vec::new();
     let mut repos = Vec::new();
     let mut base_urls = HashMap::new();
     for (id, res) in results {
         match res {
             Ok(md) => {
-                base_urls.insert(id.clone(), md.base_url);
+                base_urls.insert(id.clone(), md.base_url.clone());
                 repos.push(RepoStat {
                     id,
-                    count: md.packages.len(),
+                    count: md.len(),
                     from_cache: md.from_cache,
                     error: None,
                 });
-                packages.extend(md.packages);
+                metas.push(md);
             }
             Err(e) => {
                 tracing::warn!(repo = %id, "sync failed: {e}");
@@ -85,7 +105,7 @@ pub fn sync_enabled(force_refresh: bool) -> anyhow::Result<Synced> {
     let _ = config;
 
     Ok(Synced {
-        packages,
+        metas,
         repos,
         base_urls,
         clients,

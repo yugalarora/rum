@@ -4,6 +4,7 @@
 //! closure with --resolve), then downloads the RPMs in parallel, verifying each
 //! against its repo checksum. Does not install anything.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use super::repo_sync;
@@ -39,8 +40,13 @@ pub fn run(packages: &[String], with_deps: bool, destdir: &Path) -> anyhow::Resu
 /// to fetch them. Produced by [`resolve_packages`] *without* downloading, so
 /// callers can show the transaction and confirm before any bytes move.
 pub struct Resolution {
-    synced: repo_sync::Synced,
-    /// Indices into `synced.packages`, in resolved order.
+    /// The full available-package set (owned; the resolve path indexes and
+    /// mutates it, e.g. attaching filelists).
+    packages: Vec<AvailablePackage>,
+    /// repo id -> base URL, and repo id -> HTTP client, for fetching.
+    base_urls: HashMap<String, String>,
+    clients: HashMap<String, Http>,
+    /// Indices into `packages`, in resolved order.
     pub ids: Vec<usize>,
 }
 
@@ -50,16 +56,12 @@ impl Resolution {
     }
     /// NEVRAs of the resolved packages, sorted.
     pub fn nevras(&self) -> Vec<String> {
-        let mut v: Vec<String> = self
-            .ids
-            .iter()
-            .map(|&i| self.synced.packages[i].nevra())
-            .collect();
+        let mut v: Vec<String> = self.ids.iter().map(|&i| self.packages[i].nevra()).collect();
         v.sort();
         v
     }
     pub fn total_bytes(&self) -> u64 {
-        self.ids.iter().map(|&i| self.synced.packages[i].size).sum()
+        self.ids.iter().map(|&i| self.packages[i].size).sum()
     }
 }
 
@@ -73,52 +75,64 @@ pub struct Fetched {
 /// Resolve `packages` (optionally with their dependency closure) against the
 /// enabled repos. Does NOT download anything.
 pub fn resolve_packages(packages: &[String], with_deps: bool) -> anyhow::Result<Resolution> {
-    let mut synced = repo_sync::sync_enabled(false)?;
+    let synced = repo_sync::sync_enabled(false)?;
     for r in &synced.repos {
         if let Some(e) = &r.error {
             eprintln!("warning: repo `{}` skipped: {e}", r.id);
         }
     }
 
+    let mut pkgs = synced.owned_packages();
+    let base_urls = synced.base_urls;
+    let clients = synced.clients;
+
     if !with_deps {
         let mut ids = Vec::new();
         for spec in packages {
-            match best_match(spec, &synced.packages) {
+            match best_match(spec, &pkgs) {
                 Some(i) if !ids.contains(&i) => ids.push(i),
                 Some(_) => {}
                 None => anyhow::bail!("no package found matching `{spec}`"),
             }
         }
-        return Ok(Resolution { synced, ids });
+        return Ok(Resolution {
+            packages: pkgs,
+            base_urls,
+            clients,
+            ids,
+        });
     }
 
     let installed = installed_provides();
     let first = {
-        let candidates = build_candidates(&synced.packages);
+        let candidates = build_candidates(&pkgs);
         resolve_sat(packages, &candidates, &installed)
     };
 
-    match first {
-        Ok(r) => Ok(Resolution {
-            synced,
-            ids: r.to_install,
-        }),
+    let ids = match first {
+        Ok(r) => r.to_install,
         Err(e) => {
             // Resolution failed. If any file-path requirement is unmet, its
             // owner's path may only be in filelists.xml (not primary). Fetch
             // filelists for the wanted paths, attach them, and retry once.
-            let wanted = unmet_file_requires(&synced.packages, &installed);
+            let wanted = unmet_file_requires(&pkgs, &installed);
             if wanted.is_empty() {
                 return Err(anyhow::anyhow!("dependency resolution failed: {e}"));
             }
-            augment_with_filelists(&mut synced, &wanted);
-            let candidates = build_candidates(&synced.packages);
-            let ids = resolve_sat(packages, &candidates, &installed)
+            augment_with_filelists(&mut pkgs, &wanted);
+            let candidates = build_candidates(&pkgs);
+            resolve_sat(packages, &candidates, &installed)
                 .map_err(|e| anyhow::anyhow!("dependency resolution failed: {e}"))?
-                .to_install;
-            Ok(Resolution { synced, ids })
+                .to_install
         }
-    }
+    };
+
+    Ok(Resolution {
+        packages: pkgs,
+        base_urls,
+        clients,
+        ids,
+    })
 }
 
 fn build_candidates(pkgs: &[AvailablePackage]) -> Vec<Candidate> {
@@ -162,12 +176,10 @@ fn unmet_file_requires(
 /// Fetch filelists for the wanted paths and attach them to the owning packages
 /// (matched by pkgid == primary checksum), so file deps resolve on retry.
 fn augment_with_filelists(
-    synced: &mut repo_sync::Synced,
+    pkgs: &mut [AvailablePackage],
     wanted: &std::collections::HashSet<String>,
 ) {
-    use std::collections::HashMap;
-    let by_pkgid: HashMap<String, usize> = synced
-        .packages
+    let by_pkgid: HashMap<String, usize> = pkgs
         .iter()
         .enumerate()
         .map(|(i, p)| (p.checksum.hex.clone(), i))
@@ -175,7 +187,7 @@ fn augment_with_filelists(
 
     for (pkgid, files) in repo_sync::load_filelists(wanted) {
         if let Some(&i) = by_pkgid.get(&pkgid) {
-            synced.packages[i].files.extend(files);
+            pkgs[i].files.extend(files);
         }
     }
 }
@@ -187,9 +199,8 @@ pub fn fetch(resolution: &Resolution, destdir: &Path) -> anyhow::Result<Fetched>
 
     let mut jobs: Vec<Job> = Vec::new();
     for &i in &resolution.ids {
-        let p = &resolution.synced.packages[i];
+        let p = &resolution.packages[i];
         let base = resolution
-            .synced
             .base_urls
             .get(&p.repo_id)
             .cloned()
@@ -211,7 +222,7 @@ pub fn fetch(resolution: &Resolution, destdir: &Path) -> anyhow::Result<Fetched>
 
     let total_bytes = resolution.total_bytes();
     let start = std::time::Instant::now();
-    let failures = download_all(&jobs, &resolution.synced.clients);
+    let failures = download_all(&jobs, &resolution.clients);
     let elapsed = start.elapsed();
 
     if !failures.is_empty() {

@@ -14,6 +14,7 @@ use crate::RepoError;
 
 /// A package as advertised by a repository (not necessarily installed).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct AvailablePackage {
     pub name: String,
     /// Epoch as advertised; 0 means "no epoch" for display purposes.
@@ -53,6 +54,34 @@ impl AvailablePackage {
     }
     pub fn nevra(&self) -> String {
         format!("{}-{}.{}", self.name, self.evr(), self.arch)
+    }
+}
+
+impl ArchivedAvailablePackage {
+    /// `epoch` as a native `u64` (archived integers are endian-wrapped).
+    pub fn epoch(&self) -> u64 {
+        self.epoch.to_native()
+    }
+    pub fn evr(&self) -> String {
+        if self.epoch() == 0 {
+            format!("{}-{}", self.version, self.release)
+        } else {
+            format!("{}:{}-{}", self.epoch(), self.version, self.release)
+        }
+    }
+    pub fn name_arch(&self) -> String {
+        format!("{}.{}", self.name, self.arch)
+    }
+    pub fn nevra(&self) -> String {
+        format!("{}-{}.{}", self.name, self.evr(), self.arch)
+    }
+    /// The EVR as a comparable [`rum_solve::Evr`].
+    pub fn evr_cmp(&self) -> rum_solve::Evr {
+        rum_solve::Evr::new(
+            Some(self.epoch()),
+            self.version.as_str(),
+            self.release.as_str(),
+        )
     }
 }
 

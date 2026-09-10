@@ -12,7 +12,8 @@ tracing.workspace = true
 rum-config.workspace = true
 rum-solve.workspace = true
 serde.workspace = true
-bincode.workspace = true
+rkyv.workspace = true
+memmap2.workspace = true
 
 # HTTP with a pure-Rust TLS stack (rustls), no OpenSSL/C.
 ureq = { version = "2", default-features = false, features = ["tls"] }

@@ -59,16 +59,88 @@ pub enum RepoError {
     },
 }
 
+use primary::ArchivedAvailablePackage;
+
+/// The rkyv-archived root of the parsed-metadata cache: the list of packages.
+type ArchivedPkgs = rkyv::vec::ArchivedVec<ArchivedAvailablePackage>;
+
+/// Backing store for a repo's rkyv cache bytes: an mmap of `primary.rkyv` on the
+/// warm path (page-aligned, never fully read into the heap — important on tiny
+/// hosts) or the freshly-serialized buffer on a refresh.
+enum MetaBytes {
+    Mapped(memmap2::Mmap),
+    Owned(rkyv::util::AlignedVec),
+}
+
+impl std::ops::Deref for MetaBytes {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        match self {
+            MetaBytes::Mapped(m) => &m[..],
+            MetaBytes::Owned(v) => v.as_slice(),
+        }
+    }
+}
+
 /// The parsed metadata for one repository after a sync.
-#[derive(Debug)]
+///
+/// The packages are held as rkyv-archived bytes (mmap or owned) rather than a
+/// deserialized `Vec`. Query commands read them zero-copy via [`Self::packages`]
+/// (no per-package allocation); the resolve/download path materializes owned
+/// packages via [`Self::to_owned_packages`].
 pub struct RepoMetadata {
     pub repo_id: String,
-    pub packages: Vec<AvailablePackage>,
+    bytes: MetaBytes,
+    len: usize,
     /// True if served from the local cache without hitting the network.
     pub from_cache: bool,
     /// The base URL the metadata was fetched from; package `location` hrefs are
     /// relative to this. Needed to build RPM download URLs.
     pub base_url: String,
+}
+
+impl RepoMetadata {
+    /// Wrap cache bytes, validating the rkyv layout once so a corrupt/old-format
+    /// cache is rejected here (the caller then falls through to a refresh),
+    /// exactly as the previous checked-deserialize did.
+    fn from_bytes(
+        repo_id: String,
+        bytes: MetaBytes,
+        from_cache: bool,
+        base_url: String,
+    ) -> Result<Self, RepoError> {
+        let archived = rkyv::access::<ArchivedPkgs, rkyv::rancor::Error>(&bytes)
+            .map_err(|e| RepoError::Xml(format!("corrupt metadata cache: {e}")))?;
+        let len = archived.len();
+        Ok(RepoMetadata {
+            repo_id,
+            bytes,
+            len,
+            from_cache,
+            base_url,
+        })
+    }
+
+    /// Zero-copy view of the archived packages (no allocation).
+    pub fn packages(&self) -> &ArchivedPkgs {
+        // SAFETY: `bytes` was validated by `rkyv::access` in `from_bytes` and is
+        // immutable for the lifetime of `self`, so unchecked access is sound.
+        unsafe { rkyv::access_unchecked::<ArchivedPkgs>(&self.bytes) }
+    }
+
+    /// Materialize owned packages (used by the resolve/download path, which
+    /// mutates and indexes them). Costs a full deserialize, as before.
+    pub fn to_owned_packages(&self) -> Vec<AvailablePackage> {
+        rkyv::from_bytes::<Vec<AvailablePackage>, rkyv::rancor::Error>(&self.bytes)
+            .unwrap_or_default()
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
 }
 
 /// Options controlling a sync.
@@ -94,25 +166,36 @@ pub fn sync_repo(repo: &Repo, opts: &SyncOptions) -> Result<RepoMetadata, RepoEr
     let dir = opts.cachedir.join(&repo.id);
     let repomd_path = dir.join("repomd.xml");
     // Parsed-metadata cache: the primary.xml parsed into AvailablePackages and
-    // serialized, so warm runs skip re-parsing tens of MB of XML every time.
-    // Lives entirely under rum's own cachedir (never touches dnf/yum's cache).
-    let primary_bin = dir.join("primary.bin");
+    // serialized with rkyv, so warm runs skip re-parsing tens of MB of XML and
+    // query commands read it zero-copy (mmap'd, page-aligned) without a
+    // deserialize. Lives entirely under rum's own cachedir (never touches
+    // dnf/yum's cache).
+    let primary_cache = dir.join("primary.rkyv");
     let baseurl_path = dir.join("baseurl");
 
     // Fast path: fresh parsed cache plus a recorded base URL.
-    if !opts.force_refresh && primary_bin.exists() && is_fresh(&repomd_path, repo.metadata_expire) {
+    if !opts.force_refresh && primary_cache.exists() && is_fresh(&repomd_path, repo.metadata_expire)
+    {
         if let Ok(base_url) = std::fs::read_to_string(&baseurl_path) {
-            let bytes = read_file(&primary_bin)?;
-            if let Ok(packages) = bincode::deserialize::<Vec<AvailablePackage>>(&bytes) {
-                tracing::debug!(repo = %repo.id, count = packages.len(), "loaded parsed cache");
-                return Ok(RepoMetadata {
-                    repo_id: repo.id.clone(),
-                    packages,
-                    from_cache: true,
-                    base_url: base_url.trim().to_string(),
-                });
+            if let Ok(file) = std::fs::File::open(&primary_cache) {
+                // SAFETY: the cache is rum's own file; we treat it as immutable
+                // and validate its rkyv layout in `from_bytes`.
+                if let Ok(mmap) = unsafe { memmap2::Mmap::map(&file) } {
+                    match RepoMetadata::from_bytes(
+                        repo.id.clone(),
+                        MetaBytes::Mapped(mmap),
+                        true,
+                        base_url.trim().to_string(),
+                    ) {
+                        Ok(md) => {
+                            tracing::debug!(repo = %repo.id, count = md.len(), "loaded parsed cache");
+                            return Ok(md);
+                        }
+                        // Corrupt/old-format cache: fall through and refresh.
+                        Err(e) => tracing::debug!(repo = %repo.id, "cache rejected: {e}"),
+                    }
+                }
             }
-            // Corrupt/old-format cache: fall through and refresh.
         }
     }
 
@@ -153,19 +236,14 @@ pub fn sync_repo(repo: &Repo, opts: &SyncOptions) -> Result<RepoMetadata, RepoEr
     tracing::info!(repo = %repo.id, count = packages.len(), %base, "refreshed metadata");
 
     // Persist to cache: repomd.xml (freshness anchor) plus the parsed packages
-    // serialized to primary.bin (write primary.bin last, so a present parsed
+    // serialized with rkyv to primary.rkyv (written last, so a present parsed
     // cache always has a matching repomd.xml governing its freshness).
-    let encoded = bincode::serialize(&packages)
+    let encoded = rkyv::to_bytes::<rkyv::rancor::Error>(&packages)
         .map_err(|e| RepoError::Xml(format!("failed to serialize metadata cache: {e}")))?;
-    write_cache(&dir, &repomd_path, &repomd_bytes, &primary_bin, &encoded)?;
+    write_cache(&dir, &repomd_path, &repomd_bytes, &primary_cache, &encoded)?;
     let _ = std::fs::write(&baseurl_path, &base);
 
-    Ok(RepoMetadata {
-        repo_id: repo.id.clone(),
-        packages,
-        from_cache: false,
-        base_url: base,
-    })
+    RepoMetadata::from_bytes(repo.id.clone(), MetaBytes::Owned(encoded), false, base)
 }
 
 /// Lazily load file ownership from a repo's `filelists.xml`, filtered to
@@ -322,13 +400,13 @@ fn read_file(path: &Path) -> Result<Vec<u8>, RepoError> {
 }
 
 /// Write the freshness anchor (repomd.xml) and the parsed-metadata cache
-/// (primary.bin). repomd is written first so the parsed cache never appears
+/// (primary.rkyv). repomd is written first so the parsed cache never appears
 /// without a repomd governing its freshness.
 fn write_cache(
     dir: &Path,
     repomd_path: &Path,
     repomd: &[u8],
-    primary_bin: &Path,
+    primary_cache: &Path,
     parsed: &[u8],
 ) -> Result<(), RepoError> {
     std::fs::create_dir_all(dir).map_err(|source| RepoError::Io {
@@ -339,8 +417,8 @@ fn write_cache(
         path: repomd_path.to_path_buf(),
         source,
     })?;
-    std::fs::write(primary_bin, parsed).map_err(|source| RepoError::Io {
-        path: primary_bin.to_path_buf(),
+    std::fs::write(primary_cache, parsed).map_err(|source| RepoError::Io {
+        path: primary_cache.to_path_buf(),
         source,
     })?;
     Ok(())
