@@ -53,7 +53,8 @@ pub fn run(packages: &[String], assume_yes: bool) -> anyhow::Result<()> {
 
 /// Erase natively through librpm (`rpmtsRun`). Requires root.
 fn commit_remove_native(packages: &[String]) -> anyhow::Result<()> {
-    let mut tx = Transaction::new().map_err(|e| anyhow::anyhow!("cannot start transaction: {e}"))?;
+    let mut tx =
+        Transaction::new().map_err(|e| anyhow::anyhow!("cannot start transaction: {e}"))?;
     for p in packages {
         tx.add_erase(p).map_err(|e| anyhow::anyhow!("{e}"))?;
     }

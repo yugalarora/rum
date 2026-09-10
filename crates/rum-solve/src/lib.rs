@@ -23,8 +23,18 @@ pub use sat::resolve_sat;
 pub use vercmp::rpmvercmp;
 
 /// An epoch:version-release tuple, RPM's unit of "which build is newer".
-#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
-#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 pub struct Evr {
     /// A missing epoch is treated as 0 (RPM/dnf convention).
     pub epoch: u64,

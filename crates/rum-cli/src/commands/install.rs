@@ -56,10 +56,10 @@ fn commit_install(files: &[PathBuf]) -> anyhow::Result<()> {
 
 /// Commit natively through librpm (`rpmtsRun`), no subprocess. Requires root.
 fn commit_install_native(files: &[PathBuf]) -> anyhow::Result<()> {
-    let mut tx = Transaction::new().map_err(|e| anyhow::anyhow!("cannot start transaction: {e}"))?;
+    let mut tx =
+        Transaction::new().map_err(|e| anyhow::anyhow!("cannot start transaction: {e}"))?;
     for f in files {
-        tx.add_install(f)
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        tx.add_install(f).map_err(|e| anyhow::anyhow!("{e}"))?;
     }
     tx.run(false).map_err(|e| anyhow::anyhow!("{e}"))?;
     println!("Complete!");

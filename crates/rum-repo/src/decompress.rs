@@ -50,7 +50,10 @@ mod tests {
 
     fn read_all(location: &str, data: &[u8]) -> Vec<u8> {
         let mut out = Vec::new();
-        reader(location, data).unwrap().read_to_end(&mut out).unwrap();
+        reader(location, data)
+            .unwrap()
+            .read_to_end(&mut out)
+            .unwrap();
         out
     }
 
