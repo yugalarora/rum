@@ -933,6 +933,7 @@ name = "rum-repo"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "flate2",
  "hex",
  "lzma-rs",

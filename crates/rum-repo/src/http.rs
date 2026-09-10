@@ -1,16 +1,30 @@
 //! HTTP fetching (pure-Rust TLS via rustls) and mirror/metalink resolution.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
+
+use base64::Engine;
 
 use crate::RepoError;
 use rum_config::{Repo, RepoSource};
+
+// AWS RHUI (Red Hat's Update Infrastructure on EC2) authorizes content requests
+// with two HTTP headers carrying the instance's signed identity, injected by
+// the `amazon-id` dnf plugin. The client TLS cert alone gets a 403 on the Pulp
+// content endpoint; these headers are what unlock it.
+const RHUI_ID_HEADER: &str = "X-RHUI-ID";
+const RHUI_SIG_HEADER: &str = "X-RHUI-SIGNATURE";
+const IMDS_TOKEN_URL: &str = "http://169.254.169.254/latest/api/token";
+const IMDS_DOC_URL: &str = "http://169.254.169.254/latest/dynamic/instance-identity/document";
+const IMDS_SIG_URL: &str = "http://169.254.169.254/latest/dynamic/instance-identity/signature";
 
 /// A reusable HTTP client. Holds a connection-pooling agent. Cheap to clone
 /// (the agent is `Arc`-backed) and safe to share across threads.
 #[derive(Clone)]
 pub struct Http {
     agent: ureq::Agent,
+    /// Extra headers sent on every request (e.g. the RHUI identity headers).
+    headers: Vec<(String, String)>,
 }
 
 impl Default for Http {
@@ -22,24 +36,40 @@ impl Default for Http {
 impl Http {
     pub fn new() -> Self {
         let agent = base_builder().build();
-        Http { agent }
+        Http {
+            agent,
+            headers: Vec::new(),
+        }
     }
 
     /// Build an HTTP client honouring a repo's TLS settings (client
-    /// certificate for mutual-TLS repos like Red Hat RHUI, and an extra CA).
+    /// certificate for mutual-TLS repos like Red Hat RHUI, and an extra CA),
+    /// and, for RHUI repos, the `X-RHUI-ID`/`X-RHUI-SIGNATURE` identity headers.
     /// Falls back to the default client when no client cert is configured.
     pub fn for_repo(repo: &Repo) -> Result<Self, RepoError> {
+        let headers = if is_rhui(repo) {
+            rhui_identity_headers()
+        } else {
+            Vec::new()
+        };
         let (Some(cert), Some(key)) = (&repo.sslclientcert, &repo.sslclientkey) else {
-            return Ok(Self::new());
+            return Ok(Http {
+                agent: base_builder().build(),
+                headers,
+            });
         };
         let config = client_cert_config(cert, key, repo.sslcacert.as_deref())?;
         let agent = base_builder().tls_config(Arc::new(config)).build();
-        Ok(Http { agent })
+        Ok(Http { agent, headers })
     }
 
     /// GET a URL and return the raw body bytes.
     pub fn get_bytes(&self, url: &str) -> Result<Vec<u8>, RepoError> {
-        let resp = self.agent.get(url).call().map_err(|e| RepoError::Http {
+        let mut req = self.agent.get(url);
+        for (k, v) in &self.headers {
+            req = req.set(k, v);
+        }
+        let resp = req.call().map_err(|e| RepoError::Http {
             url: url.to_string(),
             source: Box::new(e),
         })?;
@@ -163,6 +193,62 @@ pub fn detect_aws_region() -> Option<String> {
         .ok()?;
     let region = region.trim().to_string();
     (!region.is_empty()).then_some(region)
+}
+
+/// Is this an AWS RHUI repo (needs the instance-identity headers)? Matches
+/// dnf's `amazon-id` plugin heuristic (`rhui-` in the id) plus the RHUI host.
+fn is_rhui(repo: &Repo) -> bool {
+    if repo.id.contains("rhui") {
+        return true;
+    }
+    let host_match = |u: &str| u.contains("aws.ce.redhat.com");
+    match &repo.source {
+        RepoSource::BaseUrls(urls) => urls.iter().any(|u| host_match(u)),
+        RepoSource::MirrorList(u) | RepoSource::MetaLink(u) => host_match(u),
+    }
+}
+
+/// The `X-RHUI-ID` / `X-RHUI-SIGNATURE` headers for RHUI content authorization,
+/// mirroring the `amazon-id` dnf plugin: the EC2 instance-identity document and
+/// its signature, each urlsafe-base64-encoded. Fetched once per process (via
+/// IMDSv2); empty off-EC2 or on any failure.
+fn rhui_identity_headers() -> Vec<(String, String)> {
+    static CACHE: OnceLock<Vec<(String, String)>> = OnceLock::new();
+    CACHE
+        .get_or_init(|| fetch_rhui_identity().unwrap_or_default())
+        .clone()
+}
+
+fn fetch_rhui_identity() -> Option<Vec<(String, String)>> {
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_millis(500))
+        .timeout_read(Duration::from_millis(500))
+        .build();
+    let token = agent
+        .put(IMDS_TOKEN_URL)
+        .set("X-aws-ec2-metadata-token-ttl-seconds", "3600")
+        .call()
+        .ok()?
+        .into_string()
+        .ok()?;
+    let fetch = |url: &str| -> Option<Vec<u8>> {
+        let mut buf = Vec::new();
+        let resp = agent
+            .get(url)
+            .set("X-aws-ec2-metadata-token", &token)
+            .call()
+            .ok()?;
+        std::io::Read::read_to_end(&mut resp.into_reader(), &mut buf).ok()?;
+        Some(buf)
+    };
+    let doc = fetch(IMDS_DOC_URL)?;
+    let sig = fetch(IMDS_SIG_URL)?;
+    // URL_SAFE keeps '=' padding, matching Python's urlsafe_b64encode.
+    let enc = base64::engine::general_purpose::URL_SAFE;
+    Some(vec![
+        (RHUI_ID_HEADER.to_string(), enc.encode(&doc)),
+        (RHUI_SIG_HEADER.to_string(), enc.encode(&sig)),
+    ])
 }
 
 fn trim_trailing_slash(u: &str) -> String {

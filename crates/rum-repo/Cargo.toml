@@ -14,6 +14,7 @@ rum-solve.workspace = true
 serde.workspace = true
 rkyv.workspace = true
 memmap2.workspace = true
+base64.workspace = true
 
 # HTTP with a pure-Rust TLS stack (rustls), no OpenSSL/C.
 ureq = { version = "2", default-features = false, features = ["tls"] }
