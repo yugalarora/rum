@@ -25,13 +25,14 @@ use std::fmt::Display;
 use resolvo::utils::Pool;
 use resolvo::{
     Candidates, Condition, ConditionId, ConditionalRequirement, Dependencies, DependencyProvider,
-    Interner, KnownDependencies, NameId, Problem, SolvableId, Solver, SolverCache, StringId,
-    UnsolvableOrCancelled, VersionSetId, VersionSetUnionId,
+    Interner, KnownDependencies, LogicalOperator, NameId, Problem, Requirement, SolvableId, Solver,
+    SolverCache, StringId, UnsolvableOrCancelled, VersionSetId, VersionSetUnionId,
 };
 use version_ranges::Ranges;
 
 use crate::dep::DepFlag;
 use crate::resolve::{Candidate, ResolveError, Resolved};
+use crate::richdep::{self, RichExpr};
 use crate::{Dep, Evr};
 
 struct RpmProvider {
@@ -53,15 +54,185 @@ struct RpmProvider {
     /// `rpmdsCompare`, a versionless provide satisfies ANY versioned require, so
     /// these must pass the version-set filter unconditionally.
     wildcard: HashSet<SolvableId>,
+    /// Conditions referenced by conditional requirements (rich/boolean deps),
+    /// indexed by `ConditionId`.
+    conditions: Vec<Condition>,
 }
 
-/// Requirements rum does not resolve against repo packages:
-///   * `rpmlib(...)` — rpm feature flags, satisfied by rpm itself.
-///   * rich/boolean deps like `(mysql-selinux if selinux-policy-targeted)` —
-///     not yet parsed; skipped so they don't make the set unsolvable (rum may
-///     therefore not pull a conditional dependency, like weak deps).
+/// `rpmlib(...)` feature flags are satisfied by rpm itself, not repo packages.
 fn is_ignorable_dep(name: &str) -> bool {
-    name.starts_with("rpmlib(") || name.starts_with('(')
+    name.starts_with("rpmlib(")
+}
+
+/// Collect every capability name referenced (as a Term) in a rich expression.
+fn collect_rich_names(e: &RichExpr, out: &mut HashSet<String>) {
+    match e {
+        RichExpr::Term(d) => {
+            out.insert(d.name.clone());
+        }
+        RichExpr::And(a, b)
+        | RichExpr::Or(a, b)
+        | RichExpr::If(a, b)
+        | RichExpr::Unless(a, b)
+        | RichExpr::With(a, b)
+        | RichExpr::Without(a, b) => {
+            collect_rich_names(a, out);
+            collect_rich_names(b, out);
+        }
+        RichExpr::IfElse(a, b, c) | RichExpr::UnlessElse(a, b, c) => {
+            collect_rich_names(a, out);
+            collect_rich_names(b, out);
+            collect_rich_names(c, out);
+        }
+    }
+}
+
+/// Mint a new ConditionId for `cond`.
+fn mint(conds: &mut Vec<Condition>, cond: Condition) -> ConditionId {
+    let id = ConditionId::new(conds.len() as u32);
+    conds.push(cond);
+    id
+}
+
+/// Build a resolvo Condition from a rich expression (used on the condition side
+/// of `if`/`unless`). and/or become Binary; anything else falls back to its
+/// leftmost term.
+fn build_cond(pool: &Pool<Ranges<Evr>>, conds: &mut Vec<Condition>, e: &RichExpr) -> ConditionId {
+    match e {
+        RichExpr::And(a, b) => {
+            let ca = build_cond(pool, conds, a);
+            let cb = build_cond(pool, conds, b);
+            mint(conds, Condition::Binary(LogicalOperator::And, ca, cb))
+        }
+        RichExpr::Or(a, b) => {
+            let ca = build_cond(pool, conds, a);
+            let cb = build_cond(pool, conds, b);
+            mint(conds, Condition::Binary(LogicalOperator::Or, ca, cb))
+        }
+        RichExpr::Term(d) => {
+            let cap = pool.intern_package_name(d.name.clone());
+            mint(conds, Condition::Requirement(version_set(pool, cap, d)))
+        }
+        // Rare: a compound condition; approximate with its leftmost term.
+        RichExpr::If(a, _)
+        | RichExpr::IfElse(a, _, _)
+        | RichExpr::Unless(a, _)
+        | RichExpr::UnlessElse(a, _, _)
+        | RichExpr::With(a, _)
+        | RichExpr::Without(a, _) => build_cond(pool, conds, a),
+    }
+}
+
+/// Collect the version sets of all Term leaves (used to build an OR union).
+fn collect_or_vss(pool: &Pool<Ranges<Evr>>, e: &RichExpr, out: &mut Vec<VersionSetId>) {
+    match e {
+        RichExpr::Term(d) => {
+            let cap = pool.intern_package_name(d.name.clone());
+            out.push(version_set(pool, cap, d));
+        }
+        RichExpr::And(a, b) | RichExpr::Or(a, b) => {
+            collect_or_vss(pool, a, out);
+            collect_or_vss(pool, b, out);
+        }
+        _ => {}
+    }
+}
+
+/// Is a condition expression already satisfied by the installed system? RPM's
+/// `if`/`unless` condition on installed state, so we pre-evaluate against the
+/// installed capabilities (by name).
+fn cond_installed(e: &RichExpr, installed: &HashSet<String>) -> bool {
+    match e {
+        RichExpr::Term(d) => installed.contains(&d.name),
+        RichExpr::And(a, b) => cond_installed(a, installed) && cond_installed(b, installed),
+        RichExpr::Or(a, b) => cond_installed(a, installed) || cond_installed(b, installed),
+        RichExpr::If(a, _)
+        | RichExpr::IfElse(a, _, _)
+        | RichExpr::Unless(a, _)
+        | RichExpr::UnlessElse(a, _, _)
+        | RichExpr::With(a, _)
+        | RichExpr::Without(a, _) => cond_installed(a, installed),
+    }
+}
+
+/// Map a rich expression to resolvo conditional requirements, appending to `out`.
+/// `cond` is an ambient condition (from an enclosing `if`). `installed` is the
+/// set of installed capability names, used to pre-evaluate `if`/`unless`.
+fn emit_rich(
+    pool: &Pool<Ranges<Evr>>,
+    conds: &mut Vec<Condition>,
+    installed: &HashSet<String>,
+    e: &RichExpr,
+    cond: Option<ConditionId>,
+    out: &mut Vec<ConditionalRequirement>,
+) {
+    match e {
+        RichExpr::Term(d) => {
+            let cap = pool.intern_package_name(d.name.clone());
+            out.push(ConditionalRequirement {
+                condition: cond,
+                requirement: Requirement::Single(version_set(pool, cap, d)),
+            });
+        }
+        RichExpr::And(a, b) => {
+            emit_rich(pool, conds, installed, a, cond, out);
+            emit_rich(pool, conds, installed, b, cond, out);
+        }
+        RichExpr::Or(..) => {
+            let mut vss = Vec::new();
+            collect_or_vss(pool, e, &mut vss);
+            if let Some((first, rest)) = vss.split_first() {
+                let union = pool.intern_version_set_union(*first, rest.iter().copied());
+                out.push(ConditionalRequirement {
+                    condition: cond,
+                    requirement: Requirement::Union(union),
+                });
+            }
+        }
+        // `then if cond`: if cond already holds on the system, require `then`
+        // unconditionally; otherwise make it conditional on cond entering the
+        // transaction (so both dnf senses — installed or co-installed — work).
+        RichExpr::If(then, c) => {
+            if cond_installed(c, installed) {
+                emit_rich(pool, conds, installed, then, cond, out);
+            } else {
+                let cid = build_cond(pool, conds, c);
+                let combined = match cond {
+                    None => cid,
+                    Some(o) => mint(conds, Condition::Binary(LogicalOperator::And, o, cid)),
+                };
+                emit_rich(pool, conds, installed, then, Some(combined), out);
+            }
+        }
+        // `then if cond else els`: pick the branch by installed state.
+        RichExpr::IfElse(then, c, els) => {
+            let branch = if cond_installed(c, installed) {
+                then
+            } else {
+                els
+            };
+            emit_rich(pool, conds, installed, branch, cond, out);
+        }
+        // `body unless cond`: require body unless cond is present.
+        RichExpr::Unless(body, c) => {
+            if !cond_installed(c, installed) {
+                emit_rich(pool, conds, installed, body, cond, out);
+            }
+        }
+        RichExpr::UnlessElse(body, c, els) => {
+            let branch = if cond_installed(c, installed) {
+                els
+            } else {
+                body
+            };
+            emit_rich(pool, conds, installed, branch, cond, out);
+        }
+        // `with`/`without`: no intersection in resolvo; require the primary
+        // operand (approximation, documented).
+        RichExpr::With(a, _) | RichExpr::Without(a, _) => {
+            emit_rich(pool, conds, installed, a, cond, out)
+        }
+    }
 }
 
 fn version_set(pool: &Pool<Ranges<Evr>>, cap: NameId, dep: &Dep) -> VersionSetId {
@@ -99,30 +270,51 @@ fn build(
     let mut installed: HashSet<SolvableId> = HashSet::new();
     let mut pkg_evr: HashMap<SolvableId, Evr> = HashMap::new();
     let mut wildcard: HashSet<SolvableId> = HashSet::new();
+    let mut conditions: Vec<Condition> = Vec::new();
+    // Installed capability names, for pre-evaluating rich `if`/`unless`.
+    let installed_names: HashSet<String> =
+        installed_provides.iter().map(|(n, _)| n.clone()).collect();
 
     for (ci, c) in candidates.iter().enumerate() {
         // Build the package's requirements once; every provider solvable for
         // this package shares them, so selecting the package via *any*
         // capability pulls its dependencies.
-        // Hard requires, plus (when weak deps are on) the Recommends whose
-        // capability is providable — installed as if required, matching dnf's
-        // default. Unsatisfiable recommends are dropped here so they never make
-        // the solve fail.
-        let weak = include_recommends
-            .then(|| c.recommends.iter())
-            .into_iter()
-            .flatten()
-            .filter(|r| providable.contains(&r.name));
-        let reqs: Vec<ConditionalRequirement> = c
-            .requires
-            .iter()
-            .chain(weak)
-            .filter(|r| !is_ignorable_dep(&r.name))
-            .map(|r| {
-                let cap = pool.intern_package_name(r.name.clone());
-                ConditionalRequirement::from(version_set(&pool, cap, r))
-            })
-            .collect();
+        let mut reqs: Vec<ConditionalRequirement> = Vec::new();
+        // Hard requires, including rich/boolean deps (parsed into conditional
+        // requirements / unions).
+        for r in &c.requires {
+            if is_ignorable_dep(&r.name) {
+                continue;
+            }
+            if richdep::is_rich(&r.name) {
+                if let Some(expr) = richdep::parse_rich(&r.name) {
+                    emit_rich(
+                        &pool,
+                        &mut conditions,
+                        &installed_names,
+                        &expr,
+                        None,
+                        &mut reqs,
+                    );
+                }
+                continue;
+            }
+            let cap = pool.intern_package_name(r.name.clone());
+            reqs.push(ConditionalRequirement::from(version_set(&pool, cap, r)));
+        }
+        // Weak deps (Recommends): simple, providable ones, installed as if
+        // required (dnf default). Rich recommends are rare and skipped.
+        if include_recommends {
+            for r in &c.recommends {
+                if is_ignorable_dep(&r.name) || richdep::is_rich(&r.name) {
+                    continue;
+                }
+                if providable.contains(&r.name) {
+                    let cap = pool.intern_package_name(r.name.clone());
+                    reqs.push(ConditionalRequirement::from(version_set(&pool, cap, r)));
+                }
+            }
+        }
 
         // Capabilities this package offers: its own name (versioned, = package
         // EVR) plus every Provides / file. A Provides with no version is
@@ -183,6 +375,7 @@ fn build(
         candidate_of,
         pkg_evr,
         wildcard,
+        conditions,
     }
 }
 
@@ -211,14 +404,12 @@ impl Interner for RpmProvider {
     }
     fn version_sets_in_union(
         &self,
-        _union: VersionSetUnionId,
+        union: VersionSetUnionId,
     ) -> impl Iterator<Item = VersionSetId> {
-        // We never construct version-set unions.
-        std::iter::empty()
+        self.pool.resolve_version_set_union(union)
     }
-    fn resolve_condition(&self, _condition: ConditionId) -> Condition {
-        // We never construct conditions.
-        unreachable!("rum does not use conditional requirements")
+    fn resolve_condition(&self, condition: ConditionId) -> Condition {
+        self.conditions[condition.as_u32() as usize].clone()
     }
 }
 
@@ -344,13 +535,24 @@ fn attempt(
     let mut required: HashSet<String> = HashSet::new();
     for c in candidates {
         for r in &c.requires {
-            if !is_ignorable_dep(&r.name) {
-                required.insert(r.name.clone());
+            if is_ignorable_dep(&r.name) {
+                continue;
             }
+            if richdep::is_rich(&r.name) {
+                // Materialize the capabilities named inside the boolean expr.
+                if let Some(expr) = richdep::parse_rich(&r.name) {
+                    collect_rich_names(&expr, &mut required);
+                }
+                continue;
+            }
+            required.insert(r.name.clone());
         }
         if include_recommends {
             for r in &c.recommends {
-                if !is_ignorable_dep(&r.name) && providable.contains(&r.name) {
+                if !is_ignorable_dep(&r.name)
+                    && !richdep::is_rich(&r.name)
+                    && providable.contains(&r.name)
+                {
                     required.insert(r.name.clone());
                 }
             }
@@ -555,6 +757,39 @@ mod tests {
             r.contains(&1) && r.contains(&2),
             "arch-qualified EQ provides must resolve"
         );
+    }
+
+    #[test]
+    fn rich_if_pulls_dep_when_condition_installed() {
+        // app Requires: (extra if trigger). Mirrors mariadb's
+        // (mysql-selinux if selinux-policy-targeted).
+        let mut app = cand(0, "app", "1.0", &[], &[]);
+        app.requires = vec![Dep::unversioned("(extra if trigger)")];
+        let extra = cand(1, "extra", "1.0", &["extra"], &[]);
+
+        // trigger installed -> extra should be pulled.
+        let installed = vec![("trigger".to_string(), None)];
+        let r = resolve_sat(&["app".into()], &[app.clone(), extra.clone()], &installed)
+            .unwrap()
+            .to_install;
+        assert!(r.contains(&1), "extra pulled because trigger is installed");
+
+        // trigger absent -> extra not pulled (condition false).
+        let r2 = resolve_sat(&["app".into()], &[app, extra], &[])
+            .unwrap()
+            .to_install;
+        assert!(!r2.contains(&1), "extra not pulled when trigger absent");
+    }
+
+    #[test]
+    fn rich_or_resolves_via_either_provider() {
+        let mut app = cand(0, "app", "1.0", &[], &[]);
+        app.requires = vec![Dep::unversioned("(webA or webB)")];
+        let weba = cand(1, "webA", "1.0", &["webA"], &[]);
+        let r = resolve_sat(&["app".into()], &[app, weba], &[])
+            .unwrap()
+            .to_install;
+        assert!(r.contains(&1), "OR satisfied by the available provider");
     }
 
     #[test]

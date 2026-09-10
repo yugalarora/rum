@@ -11,6 +11,7 @@
 
 mod dep;
 mod resolve;
+mod richdep;
 mod sat;
 mod vercmp;
 
