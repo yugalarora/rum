@@ -85,9 +85,17 @@ impl ArchivedAvailablePackage {
     }
 }
 
-/// Parse the decompressed primary.xml, tagging every package with `repo_id`.
-pub fn parse(xml: &[u8], repo_id: &str) -> Result<Vec<AvailablePackage>, RepoError> {
-    let mut reader = Reader::from_reader(xml);
+/// Parse primary.xml from any reader, tagging every package with `repo_id`.
+///
+/// Reads incrementally (via an internal `BufReader`) so a large decompressed
+/// primary (RHEL's runs to ~1-2GB) is never fully materialized in memory. The
+/// caller streams the decompressor output straight in; only the resulting
+/// `Vec<AvailablePackage>` is retained.
+pub fn parse_reader<R: std::io::Read>(
+    input: R,
+    repo_id: &str,
+) -> Result<Vec<AvailablePackage>, RepoError> {
+    let mut reader = Reader::from_reader(std::io::BufReader::new(input));
     reader.config_mut().trim_text(true);
 
     let mut out = Vec::new();
@@ -361,7 +369,7 @@ mod tests {
           </package>
         </metadata>"#;
 
-        let pkgs = parse(xml, "baseos").unwrap();
+        let pkgs = parse_reader(&xml[..], "baseos").unwrap();
         assert_eq!(pkgs.len(), 2);
 
         let bash = &pkgs[0];

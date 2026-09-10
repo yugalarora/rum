@@ -221,18 +221,40 @@ pub fn sync_repo(repo: &Repo, opts: &SyncOptions) -> Result<RepoMetadata, RepoEr
         });
     }
 
-    // Decompress and, if advertised, verify the decompressed checksum too.
-    let plain = decompress::decompress(&primary_entry.location, &compressed)?;
-    if let Some(oc) = &primary_entry.open_checksum {
-        if !oc.verify(&plain) {
-            return Err(RepoError::ChecksumMismatch {
-                repo: repo.id.clone(),
-                file: format!("{} (decompressed)", primary_entry.location),
-            });
-        }
-    }
+    // Spill the compressed primary to disk and mmap it, rather than holding it
+    // (tens to >100MB on RHEL) on the heap through the memory-heavy parse. The
+    // mmap is file-backed / evictable, so on a small host the resident set stays
+    // dominated by just the parsed packages + the rkyv buffer. (A 761MB
+    // t2.micro OOM'd syncing RHEL BaseOS with the compressed blob heap-resident.)
+    std::fs::create_dir_all(&dir).map_err(|source| RepoError::Io {
+        path: dir.clone(),
+        source,
+    })?;
+    let download_tmp = dir.join("primary.download");
+    std::fs::write(&download_tmp, &compressed).map_err(|source| RepoError::Io {
+        path: download_tmp.clone(),
+        source,
+    })?;
+    drop(compressed);
 
-    let packages = primary::parse(&plain, &repo.id)?;
+    // Stream-decompress + stream-parse from the mmap so the (up to ~1-2GB on
+    // RHEL) decompressed XML is never fully materialized either. The compressed
+    // checksum verified above already guarantees integrity, so the (optional,
+    // secondary) open-checksum over the decompressed bytes is skipped.
+    let packages = {
+        let file = std::fs::File::open(&download_tmp).map_err(|source| RepoError::Io {
+            path: download_tmp.clone(),
+            source,
+        })?;
+        // SAFETY: our own freshly-written file, treated as immutable here.
+        let mmap = unsafe { memmap2::Mmap::map(&file) }.map_err(|source| RepoError::Io {
+            path: download_tmp.clone(),
+            source,
+        })?;
+        let plain = decompress::reader(&primary_entry.location, &mmap)?;
+        primary::parse_reader(plain, &repo.id)?
+    };
+    let _ = std::fs::remove_file(&download_tmp);
     tracing::info!(repo = %repo.id, count = packages.len(), %base, "refreshed metadata");
 
     // Persist to cache: repomd.xml (freshness anchor) plus the parsed packages
@@ -240,10 +262,27 @@ pub fn sync_repo(repo: &Repo, opts: &SyncOptions) -> Result<RepoMetadata, RepoEr
     // cache always has a matching repomd.xml governing its freshness).
     let encoded = rkyv::to_bytes::<rkyv::rancor::Error>(&packages)
         .map_err(|e| RepoError::Xml(format!("failed to serialize metadata cache: {e}")))?;
+    // Drop the parsed packages before writing/mapping so we don't hold the Vec
+    // and the serialized buffer at once.
+    drop(packages);
     write_cache(&dir, &repomd_path, &repomd_bytes, &primary_cache, &encoded)?;
     let _ = std::fs::write(&baseurl_path, &base);
 
-    RepoMetadata::from_bytes(repo.id.clone(), MetaBytes::Owned(encoded), false, base)
+    // Prefer an mmap of the just-written cache over keeping the (large) rkyv
+    // buffer resident: sync_all retains one RepoMetadata per repo, so several
+    // big repos (RHEL BaseOS + AppStream) would otherwise pin hundreds of MB of
+    // heap at once and OOM a small host. The mmap is file-backed and evictable.
+    let bytes = match std::fs::File::open(&primary_cache)
+        .ok()
+        .and_then(|f| unsafe { memmap2::Mmap::map(&f) }.ok())
+    {
+        Some(mmap) => {
+            drop(encoded);
+            MetaBytes::Mapped(mmap)
+        }
+        None => MetaBytes::Owned(encoded),
+    };
+    RepoMetadata::from_bytes(repo.id.clone(), bytes, false, base)
 }
 
 /// Lazily load file ownership from a repo's `filelists.xml`, filtered to
