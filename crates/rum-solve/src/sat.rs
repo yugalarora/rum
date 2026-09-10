@@ -509,6 +509,55 @@ mod tests {
     }
 
     #[test]
+    fn version_locked_arch_qualified_eq_requires() {
+        // Reproduces the deep -devel pattern (clang-devel, postgresql*-devel):
+        // a package with EQ requires on ARCH-QUALIFIED capabilities that other
+        // packages provide versioned, all pinned to one version.
+        let evr = |v: &str| Evr::new(Some(0), v, "1");
+        let vprov = |name: &str, v: &str| Dep {
+            name: name.into(),
+            flag: DepFlag::Eq,
+            evr: Some(evr(v)),
+        };
+        // app Requires: lib(x86-64) = 1.0 AND tool(x86-64) = 1.0
+        let app = Candidate {
+            id: 0,
+            name: "app".into(),
+            arch: "x86_64".into(),
+            evr: evr("1.0"),
+            provides: vec![],
+            requires: vec![vprov("lib(x86-64)", "1.0"), vprov("tool(x86-64)", "1.0")],
+            recommends: vec![],
+        };
+        // lib and tool each carry a versioned arch-qualified provide.
+        let lib = Candidate {
+            id: 1,
+            name: "lib".into(),
+            arch: "x86_64".into(),
+            evr: evr("1.0"),
+            provides: vec![vprov("lib(x86-64)", "1.0")],
+            requires: vec![],
+            recommends: vec![],
+        };
+        let tool = Candidate {
+            id: 2,
+            name: "tool".into(),
+            arch: "x86_64".into(),
+            evr: evr("1.0"),
+            provides: vec![vprov("tool(x86-64)", "1.0")],
+            requires: vec![],
+            recommends: vec![],
+        };
+        let r = resolve_sat(&["app".into()], &[app, lib, tool], &[])
+            .unwrap()
+            .to_install;
+        assert!(
+            r.contains(&1) && r.contains(&2),
+            "arch-qualified EQ provides must resolve"
+        );
+    }
+
+    #[test]
     fn unsatisfiable_errors() {
         let cands = vec![cand(0, "app", "1.0", &[], &[dep("nope")])];
         assert!(resolve_sat(&["app".into()], &cands, &[]).is_err());
