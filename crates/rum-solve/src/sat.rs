@@ -57,6 +57,10 @@ struct RpmProvider {
     /// Conditions referenced by conditional requirements (rich/boolean deps),
     /// indexed by `ConditionId`.
     conditions: Vec<Condition>,
+    /// The originating Dep for each versioned version-set, so `filter_candidates`
+    /// can apply RPM's partial-EVR comparison (e.g. `= 15.0.7` with no release
+    /// matches `15.0.7-3.amzn2023.0.4`) instead of an exact Ranges match.
+    vsdep: HashMap<VersionSetId, Dep>,
 }
 
 /// `rpmlib(...)` feature flags are satisfied by rpm itself, not repo packages.
@@ -97,21 +101,29 @@ fn mint(conds: &mut Vec<Condition>, cond: Condition) -> ConditionId {
 /// Build a resolvo Condition from a rich expression (used on the condition side
 /// of `if`/`unless`). and/or become Binary; anything else falls back to its
 /// leftmost term.
-fn build_cond(pool: &Pool<Ranges<Evr>>, conds: &mut Vec<Condition>, e: &RichExpr) -> ConditionId {
+fn build_cond(
+    pool: &Pool<Ranges<Evr>>,
+    conds: &mut Vec<Condition>,
+    vsdep: &mut HashMap<VersionSetId, Dep>,
+    e: &RichExpr,
+) -> ConditionId {
     match e {
         RichExpr::And(a, b) => {
-            let ca = build_cond(pool, conds, a);
-            let cb = build_cond(pool, conds, b);
+            let ca = build_cond(pool, conds, vsdep, a);
+            let cb = build_cond(pool, conds, vsdep, b);
             mint(conds, Condition::Binary(LogicalOperator::And, ca, cb))
         }
         RichExpr::Or(a, b) => {
-            let ca = build_cond(pool, conds, a);
-            let cb = build_cond(pool, conds, b);
+            let ca = build_cond(pool, conds, vsdep, a);
+            let cb = build_cond(pool, conds, vsdep, b);
             mint(conds, Condition::Binary(LogicalOperator::Or, ca, cb))
         }
         RichExpr::Term(d) => {
             let cap = pool.intern_package_name(d.name.clone());
-            mint(conds, Condition::Requirement(version_set(pool, cap, d)))
+            mint(
+                conds,
+                Condition::Requirement(version_set(pool, vsdep, cap, d)),
+            )
         }
         // Rare: a compound condition; approximate with its leftmost term.
         RichExpr::If(a, _)
@@ -119,20 +131,25 @@ fn build_cond(pool: &Pool<Ranges<Evr>>, conds: &mut Vec<Condition>, e: &RichExpr
         | RichExpr::Unless(a, _)
         | RichExpr::UnlessElse(a, _, _)
         | RichExpr::With(a, _)
-        | RichExpr::Without(a, _) => build_cond(pool, conds, a),
+        | RichExpr::Without(a, _) => build_cond(pool, conds, vsdep, a),
     }
 }
 
 /// Collect the version sets of all Term leaves (used to build an OR union).
-fn collect_or_vss(pool: &Pool<Ranges<Evr>>, e: &RichExpr, out: &mut Vec<VersionSetId>) {
+fn collect_or_vss(
+    pool: &Pool<Ranges<Evr>>,
+    vsdep: &mut HashMap<VersionSetId, Dep>,
+    e: &RichExpr,
+    out: &mut Vec<VersionSetId>,
+) {
     match e {
         RichExpr::Term(d) => {
             let cap = pool.intern_package_name(d.name.clone());
-            out.push(version_set(pool, cap, d));
+            out.push(version_set(pool, vsdep, cap, d));
         }
         RichExpr::And(a, b) | RichExpr::Or(a, b) => {
-            collect_or_vss(pool, a, out);
-            collect_or_vss(pool, b, out);
+            collect_or_vss(pool, vsdep, a, out);
+            collect_or_vss(pool, vsdep, b, out);
         }
         _ => {}
     }
@@ -158,9 +175,11 @@ fn cond_installed(e: &RichExpr, installed: &HashSet<String>) -> bool {
 /// Map a rich expression to resolvo conditional requirements, appending to `out`.
 /// `cond` is an ambient condition (from an enclosing `if`). `installed` is the
 /// set of installed capability names, used to pre-evaluate `if`/`unless`.
+#[allow(clippy::too_many_arguments)]
 fn emit_rich(
     pool: &Pool<Ranges<Evr>>,
     conds: &mut Vec<Condition>,
+    vsdep: &mut HashMap<VersionSetId, Dep>,
     installed: &HashSet<String>,
     e: &RichExpr,
     cond: Option<ConditionId>,
@@ -171,16 +190,16 @@ fn emit_rich(
             let cap = pool.intern_package_name(d.name.clone());
             out.push(ConditionalRequirement {
                 condition: cond,
-                requirement: Requirement::Single(version_set(pool, cap, d)),
+                requirement: Requirement::Single(version_set(pool, vsdep, cap, d)),
             });
         }
         RichExpr::And(a, b) => {
-            emit_rich(pool, conds, installed, a, cond, out);
-            emit_rich(pool, conds, installed, b, cond, out);
+            emit_rich(pool, conds, vsdep, installed, a, cond, out);
+            emit_rich(pool, conds, vsdep, installed, b, cond, out);
         }
         RichExpr::Or(..) => {
             let mut vss = Vec::new();
-            collect_or_vss(pool, e, &mut vss);
+            collect_or_vss(pool, vsdep, e, &mut vss);
             if let Some((first, rest)) = vss.split_first() {
                 let union = pool.intern_version_set_union(*first, rest.iter().copied());
                 out.push(ConditionalRequirement {
@@ -194,14 +213,14 @@ fn emit_rich(
         // transaction (so both dnf senses — installed or co-installed — work).
         RichExpr::If(then, c) => {
             if cond_installed(c, installed) {
-                emit_rich(pool, conds, installed, then, cond, out);
+                emit_rich(pool, conds, vsdep, installed, then, cond, out);
             } else {
-                let cid = build_cond(pool, conds, c);
+                let cid = build_cond(pool, conds, vsdep, c);
                 let combined = match cond {
                     None => cid,
                     Some(o) => mint(conds, Condition::Binary(LogicalOperator::And, o, cid)),
                 };
-                emit_rich(pool, conds, installed, then, Some(combined), out);
+                emit_rich(pool, conds, vsdep, installed, then, Some(combined), out);
             }
         }
         // `then if cond else els`: pick the branch by installed state.
@@ -211,12 +230,12 @@ fn emit_rich(
             } else {
                 els
             };
-            emit_rich(pool, conds, installed, branch, cond, out);
+            emit_rich(pool, conds, vsdep, installed, branch, cond, out);
         }
         // `body unless cond`: require body unless cond is present.
         RichExpr::Unless(body, c) => {
             if !cond_installed(c, installed) {
-                emit_rich(pool, conds, installed, body, cond, out);
+                emit_rich(pool, conds, vsdep, installed, body, cond, out);
             }
         }
         RichExpr::UnlessElse(body, c, els) => {
@@ -225,17 +244,24 @@ fn emit_rich(
             } else {
                 body
             };
-            emit_rich(pool, conds, installed, branch, cond, out);
+            emit_rich(pool, conds, vsdep, installed, branch, cond, out);
         }
         // `with`/`without`: no intersection in resolvo; require the primary
         // operand (approximation, documented).
         RichExpr::With(a, _) | RichExpr::Without(a, _) => {
-            emit_rich(pool, conds, installed, a, cond, out)
+            emit_rich(pool, conds, vsdep, installed, a, cond, out)
         }
     }
 }
 
-fn version_set(pool: &Pool<Ranges<Evr>>, cap: NameId, dep: &Dep) -> VersionSetId {
+fn version_set(
+    pool: &Pool<Ranges<Evr>>,
+    vsdep: &mut HashMap<VersionSetId, Dep>,
+    cap: NameId,
+    dep: &Dep,
+) -> VersionSetId {
+    // The Ranges is a coarse approximation kept for display; the authoritative
+    // match happens in filter_candidates via the stored Dep (RPM semantics).
     let ranges = match (&dep.evr, dep.flag) {
         (None, _) | (_, DepFlag::Any) => Ranges::full(),
         (Some(e), DepFlag::Eq) => Ranges::singleton(e.clone()),
@@ -244,7 +270,11 @@ fn version_set(pool: &Pool<Ranges<Evr>>, cap: NameId, dep: &Dep) -> VersionSetId
         (Some(e), DepFlag::Gt) => Ranges::strictly_higher_than(e.clone()),
         (Some(e), DepFlag::Ge) => Ranges::higher_than(e.clone()),
     };
-    pool.intern_version_set(cap, ranges)
+    let vsid = pool.intern_version_set(cap, ranges);
+    if dep.evr.is_some() {
+        vsdep.insert(vsid, dep.clone());
+    }
+    vsid
 }
 
 /// Build the resolvo provider.
@@ -271,6 +301,7 @@ fn build(
     let mut pkg_evr: HashMap<SolvableId, Evr> = HashMap::new();
     let mut wildcard: HashSet<SolvableId> = HashSet::new();
     let mut conditions: Vec<Condition> = Vec::new();
+    let mut vsdep: HashMap<VersionSetId, Dep> = HashMap::new();
     // Installed capability names, for pre-evaluating rich `if`/`unless`.
     let installed_names: HashSet<String> =
         installed_provides.iter().map(|(n, _)| n.clone()).collect();
@@ -291,6 +322,7 @@ fn build(
                     emit_rich(
                         &pool,
                         &mut conditions,
+                        &mut vsdep,
                         &installed_names,
                         &expr,
                         None,
@@ -300,7 +332,9 @@ fn build(
                 continue;
             }
             let cap = pool.intern_package_name(r.name.clone());
-            reqs.push(ConditionalRequirement::from(version_set(&pool, cap, r)));
+            reqs.push(ConditionalRequirement::from(version_set(
+                &pool, &mut vsdep, cap, r,
+            )));
         }
         // Weak deps (Recommends): simple, providable ones, installed as if
         // required (dnf default). Rich recommends are rare and skipped.
@@ -311,7 +345,9 @@ fn build(
                 }
                 if providable.contains(&r.name) {
                     let cap = pool.intern_package_name(r.name.clone());
-                    reqs.push(ConditionalRequirement::from(version_set(&pool, cap, r)));
+                    reqs.push(ConditionalRequirement::from(version_set(
+                        &pool, &mut vsdep, cap, r,
+                    )));
                 }
             }
         }
@@ -376,6 +412,7 @@ fn build(
         pkg_evr,
         wildcard,
         conditions,
+        vsdep,
     }
 }
 
@@ -420,15 +457,25 @@ impl DependencyProvider for RpmProvider {
         version_set: VersionSetId,
         inverse: bool,
     ) -> Vec<SolvableId> {
-        let ranges = self.pool.resolve_version_set(version_set);
+        let dep = self.vsdep.get(&version_set);
         candidates
             .iter()
             .copied()
             .filter(|s| {
-                // An unversioned provide (wildcard) matches any require, per
-                // RPM's rpmdsCompare; otherwise range-check the provided version.
+                // An unversioned provide (wildcard) matches any require (RPM's
+                // rpmdsCompare). For versioned requires, use the originating
+                // Dep's partial-EVR comparison (so `= 15.0.7` with no release
+                // matches `15.0.7-3.amzn2023.0.4`); this mirrors the greedy
+                // resolver and RPM exactly. Unversioned requires (no stored
+                // Dep) match on name alone, which membership already implies.
                 let matches = self.wildcard.contains(s)
-                    || ranges.contains(&self.pool.resolve_solvable(*s).record);
+                    || match dep {
+                        Some(d) => {
+                            let rec = &self.pool.resolve_solvable(*s).record;
+                            d.satisfied_by(&d.name, Some(rec))
+                        }
+                        None => true,
+                    };
                 matches != inverse
             })
             .collect()
@@ -790,6 +837,45 @@ mod tests {
             .unwrap()
             .to_install;
         assert!(r.contains(&1), "OR satisfied by the available provider");
+    }
+
+    #[test]
+    fn eq_require_without_release_matches_any_release() {
+        // Reproduces the clang-libs gap: `Requires: cap = 15.0.7` (no release)
+        // must match a provider advertising `cap = 15.0.7-3.amzn2023.0.4`.
+        let app = Candidate {
+            id: 0,
+            name: "app".into(),
+            arch: "x86_64".into(),
+            evr: Evr::new(Some(0), "1.0", "1"),
+            provides: vec![],
+            requires: vec![Dep {
+                name: "cap".into(),
+                flag: DepFlag::Eq,
+                evr: Some(Evr::new(Some(0), "15.0.7", "")), // version only, no release
+            }],
+            recommends: vec![],
+        };
+        let prov = Candidate {
+            id: 1,
+            name: "prov".into(),
+            arch: "x86_64".into(),
+            evr: Evr::new(Some(0), "15.0.7", "3.amzn2023.0.4"),
+            provides: vec![Dep {
+                name: "cap".into(),
+                flag: DepFlag::Eq,
+                evr: Some(Evr::new(Some(0), "15.0.7", "3.amzn2023.0.4")),
+            }],
+            requires: vec![],
+            recommends: vec![],
+        };
+        let r = resolve_sat(&["app".into()], &[app, prov], &[])
+            .unwrap()
+            .to_install;
+        assert!(
+            r.contains(&1),
+            "EQ without release must match any release of that version"
+        );
     }
 
     #[test]
