@@ -169,6 +169,39 @@ impl<'a> PkgView<'a> {
         self.s(self.pkg.checksum_hex.to_native())
     }
 
+    /// Provided capability names (excluding files), borrowed from the arena.
+    pub fn provide_names(&self) -> Vec<&'a str> {
+        self.pkg
+            .provides
+            .iter()
+            .map(|d| self.s(d.name.to_native()))
+            .collect()
+    }
+    /// Required capability names (may include file paths), borrowed.
+    pub fn require_names(&self) -> Vec<&'a str> {
+        self.pkg
+            .requires
+            .iter()
+            .map(|d| self.s(d.name.to_native()))
+            .collect()
+    }
+    /// Recommended (weak) capability names, borrowed.
+    pub fn recommend_names(&self) -> Vec<&'a str> {
+        self.pkg
+            .recommends
+            .iter()
+            .map(|d| self.s(d.name.to_native()))
+            .collect()
+    }
+    /// Advertised file paths, borrowed.
+    pub fn file_names(&self) -> Vec<&'a str> {
+        self.pkg
+            .files
+            .iter()
+            .map(|f| self.s(f.to_native()))
+            .collect()
+    }
+
     /// Owned `Dep`s for the resolver's hard requires.
     pub fn requires(&self) -> Vec<Dep> {
         self.pkg
@@ -185,17 +218,25 @@ impl<'a> PkgView<'a> {
             .map(|d| self.store.dep(d))
             .collect()
     }
-    /// Provides plus advertised files (as unversioned provides) — the capability
-    /// set the resolver registers, matching the download path's candidates.
-    pub fn provides_with_files(&self) -> Vec<Dep> {
-        let mut v: Vec<Dep> = self
-            .pkg
-            .provides
-            .iter()
-            .map(|d| self.store.dep(d))
-            .collect();
+    /// Provides plus advertised files (as unversioned provides), keeping only
+    /// capabilities whose name is in `keep`. Resolving the name (cheap `&str`)
+    /// before building the `Dep` avoids allocating for the many never-required
+    /// file provides in a distro's metadata.
+    pub fn provides_with_files_filtered(
+        &self,
+        keep: &std::collections::HashSet<String>,
+    ) -> Vec<Dep> {
+        let mut v: Vec<Dep> = Vec::new();
+        for d in self.pkg.provides.iter() {
+            if keep.contains(self.s(d.name.to_native())) {
+                v.push(self.store.dep(d));
+            }
+        }
         for f in self.pkg.files.iter() {
-            v.push(Dep::unversioned(self.s(f.to_native())));
+            let name = self.s(f.to_native());
+            if keep.contains(name) {
+                v.push(Dep::unversioned(name));
+            }
         }
         v
     }

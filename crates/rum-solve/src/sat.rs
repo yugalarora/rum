@@ -52,27 +52,68 @@ pub struct CandidateRef<'a> {
     pub recommends: &'a [Dep],
 }
 
+/// A name-only view of one candidate, for the cheap pre-passes (which capability
+/// names are provided/required/recommended). Carries borrowed `&str`s, so no
+/// `Dep`/`String` is allocated — unlike [`CandidateRef`], whose owned `Dep`
+/// vectors are only needed for the final pool build.
+pub struct NameView<'a> {
+    pub name: &'a str,
+    pub arch: &'a str,
+    /// Provided capability names (excluding files — see the providable pass).
+    pub provide_names: &'a [&'a str],
+    pub require_names: &'a [&'a str],
+    pub recommend_names: &'a [&'a str],
+}
+
 /// A source of candidates that can be scanned repeatedly without holding them
-/// all in memory at once. `scan` invokes `visit` once per candidate; the solver
-/// scans a few times (requested-name lookup, providable/required sets, pool
-/// build), so implementations must be cheap to re-iterate.
+/// all in memory at once. The solver runs one cheap `scan_names` pre-pass
+/// (requested/providable/required sets) and one full `scan` to build the pool,
+/// so implementations must be cheap to re-iterate.
 pub trait CandidateSource {
-    fn scan(&self, visit: &mut dyn FnMut(CandidateRef<'_>));
+    /// Full candidates (with owned `Dep`s); used once, to build the pool.
+    /// `required` is the set of capability names the pool will actually
+    /// register, so implementations may drop provides/files not in it (the
+    /// build ignores them anyway) to avoid allocating `Dep`s for the millions
+    /// of never-depended-upon files in a distro's metadata.
+    fn scan(&self, required: &HashSet<String>, visit: &mut dyn FnMut(CandidateRef<'_>));
+    /// Name-only pass (borrowed `&str`, no `Dep` allocation); used for the
+    /// providable/required/requested sets.
+    fn scan_names(&self, visit: &mut dyn FnMut(NameView<'_>));
 }
 
 /// A slice of owned `Candidate`s is a trivial source (used by tests and the
 /// greedy path). Its `id` is the candidate's own `id` field.
 impl CandidateSource for [Candidate] {
-    fn scan(&self, visit: &mut dyn FnMut(CandidateRef<'_>)) {
+    fn scan(&self, required: &HashSet<String>, visit: &mut dyn FnMut(CandidateRef<'_>)) {
         for c in self {
+            let provides: Vec<Dep> = c
+                .provides
+                .iter()
+                .filter(|d| required.contains(&d.name))
+                .cloned()
+                .collect();
             visit(CandidateRef {
                 id: c.id,
                 name: &c.name,
                 arch: &c.arch,
                 evr: c.evr.clone(),
-                provides: &c.provides,
+                provides: &provides,
                 requires: &c.requires,
                 recommends: &c.recommends,
+            });
+        }
+    }
+    fn scan_names(&self, visit: &mut dyn FnMut(NameView<'_>)) {
+        for c in self {
+            let pv: Vec<&str> = c.provides.iter().map(|d| d.name.as_str()).collect();
+            let rq: Vec<&str> = c.requires.iter().map(|d| d.name.as_str()).collect();
+            let rc: Vec<&str> = c.recommends.iter().map(|d| d.name.as_str()).collect();
+            visit(NameView {
+                name: &c.name,
+                arch: &c.arch,
+                provide_names: &pv,
+                require_names: &rq,
+                recommend_names: &rc,
             });
         }
     }
@@ -349,7 +390,7 @@ fn build<S: CandidateSource + ?Sized>(
     let installed_names: HashSet<String> =
         installed_provides.iter().map(|(n, _)| n.clone()).collect();
 
-    source.scan(&mut |c| {
+    source.scan(required, &mut |c| {
         let ci = c.id;
         // Build the package's requirements once; every provider solvable for
         // this package shares them, so selecting the package via *any*
@@ -574,33 +615,56 @@ pub fn resolve_sat_with<S: CandidateSource + ?Sized>(
     source: &S,
     installed_provides: &[(String, Option<Evr>)],
 ) -> Result<Resolved, ResolveError> {
-    // Resolve requested specs (name or name.arch) to package names up front.
-    let mut requested_names = Vec::new();
-    for spec in requested {
-        let mut found: Option<String> = None;
-        source.scan(&mut |c| {
-            if found.is_none() && (c.name == spec || format!("{}.{}", c.name, c.arch) == *spec) {
-                found = Some(c.name.to_string());
-            }
-        });
-        let name = found.ok_or_else(|| ResolveError::NotFound(spec.clone()))?;
-        if !requested_names.contains(&name) {
-            requested_names.push(name);
-        }
-    }
-
-    // Every capability a Recommends could point at (package names + versioned
-    // provides + installed). File provides (`/...`) are excluded: they never
-    // back a weak dep and would balloon this set on RHEL-scale metadata.
+    // Single cheap name-only pass gathering everything the pre-solve sets need:
+    // requested package names, the providable set, the hard-required capability
+    // names (incl. those named in rich exprs), and the raw recommend names.
+    // Walking full `Dep`s here (as the pool build does) is what dominated
+    // resolve time on large repos, so this pass stays in borrowed `&str`.
+    let mut requested_names: Vec<String> = Vec::new();
+    let mut found = vec![false; requested.len()];
     let mut providable: HashSet<String> = HashSet::new();
-    source.scan(&mut |c| {
+    let mut hard_required: HashSet<String> = HashSet::new();
+    let mut recommend_names: HashSet<String> = HashSet::new();
+    source.scan_names(&mut |c| {
+        for (i, spec) in requested.iter().enumerate() {
+            if !found[i] && (c.name == spec || format!("{}.{}", c.name, c.arch) == *spec) {
+                found[i] = true;
+                if !requested_names.iter().any(|n| n == c.name) {
+                    requested_names.push(c.name.to_string());
+                }
+            }
+        }
+        // Providable: package names + non-file provides (files never back a
+        // weak dep and would balloon this set on RHEL-scale metadata).
         providable.insert(c.name.to_string());
-        for p in c.provides {
-            if !p.name.starts_with('/') {
-                providable.insert(p.name.clone());
+        for p in c.provide_names {
+            if !p.starts_with('/') {
+                providable.insert(p.to_string());
+            }
+        }
+        for r in c.require_names {
+            if is_ignorable_dep(r) {
+                continue;
+            }
+            if richdep::is_rich(r) {
+                if let Some(expr) = richdep::parse_rich(r) {
+                    collect_rich_names(&expr, &mut hard_required);
+                }
+                continue;
+            }
+            hard_required.insert(r.to_string());
+        }
+        for r in c.recommend_names {
+            if !is_ignorable_dep(r) && !richdep::is_rich(r) {
+                recommend_names.insert(r.to_string());
             }
         }
     });
+    for (i, spec) in requested.iter().enumerate() {
+        if !found[i] {
+            return Err(ResolveError::NotFound(spec.clone()));
+        }
+    }
     for (name, _) in installed_provides {
         providable.insert(name.clone());
     }
@@ -613,6 +677,8 @@ pub fn resolve_sat_with<S: CandidateSource + ?Sized>(
         source,
         installed_provides,
         &providable,
+        &hard_required,
+        &recommend_names,
         true,
     ) {
         Err(ResolveError::Unsatisfied { .. }) => attempt(
@@ -621,50 +687,38 @@ pub fn resolve_sat_with<S: CandidateSource + ?Sized>(
             source,
             installed_provides,
             &providable,
+            &hard_required,
+            &recommend_names,
             false,
         ),
         other => other,
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn attempt<S: CandidateSource + ?Sized>(
     requested: &[String],
     requested_names: &[String],
     source: &S,
     installed_provides: &[(String, Option<Evr>)],
     providable: &HashSet<String>,
+    hard_required: &HashSet<String>,
+    recommend_names: &HashSet<String>,
     include_recommends: bool,
 ) -> Result<Resolved, ResolveError> {
     // Capabilities to materialize: everything hard-required, the requested
-    // names, and (when on) the satisfiable Recommends.
-    let mut required: HashSet<String> = HashSet::new();
-    source.scan(&mut |c| {
-        for r in c.requires {
-            if is_ignorable_dep(&r.name) {
-                continue;
-            }
-            if richdep::is_rich(&r.name) {
-                // Materialize the capabilities named inside the boolean expr.
-                if let Some(expr) = richdep::parse_rich(&r.name) {
-                    collect_rich_names(&expr, &mut required);
-                }
-                continue;
-            }
-            required.insert(r.name.clone());
-        }
-        if include_recommends {
-            for r in c.recommends {
-                if !is_ignorable_dep(&r.name)
-                    && !richdep::is_rich(&r.name)
-                    && providable.contains(&r.name)
-                {
-                    required.insert(r.name.clone());
-                }
-            }
-        }
-    });
+    // names, and (when on) the satisfiable Recommends. Assembled from the
+    // pre-pass sets — no extra scan.
+    let mut required: HashSet<String> = hard_required.clone();
     for n in requested_names {
         required.insert(n.clone());
+    }
+    if include_recommends {
+        for r in recommend_names {
+            if providable.contains(r) {
+                required.insert(r.clone());
+            }
+        }
     }
 
     let provider = build(

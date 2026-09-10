@@ -19,7 +19,7 @@ use std::cmp::Ordering;
 
 pub use dep::{ArchivedDepFlag, Dep, DepFlag};
 pub use resolve::{resolve, Candidate, ResolveError, Resolved};
-pub use sat::{resolve_sat, resolve_sat_with, CandidateRef, CandidateSource};
+pub use sat::{resolve_sat, resolve_sat_with, CandidateRef, CandidateSource, NameView};
 pub use vercmp::rpmvercmp;
 
 /// An epoch:version-release tuple, RPM's unit of "which build is newer".

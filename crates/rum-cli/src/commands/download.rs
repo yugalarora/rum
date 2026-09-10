@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use super::repo_sync;
 use rum_repo::{AvailablePackage, Http, RepoMetadata};
-use rum_solve::{resolve_sat_with, CandidateRef, CandidateSource, Dep, Evr};
+use rum_solve::{resolve_sat_with, CandidateRef, CandidateSource, Dep, Evr, NameView};
 
 pub fn run(packages: &[String], with_deps: bool, destdir: &Path) -> anyhow::Result<()> {
     if packages.is_empty() {
@@ -176,14 +176,16 @@ struct MetasSource<'a> {
 }
 
 impl CandidateSource for MetasSource<'_> {
-    fn scan(&self, visit: &mut dyn FnMut(CandidateRef<'_>)) {
+    fn scan(&self, required: &HashSet<String>, visit: &mut dyn FnMut(CandidateRef<'_>)) {
         for (ri, m) in self.metas.iter().enumerate() {
             let base = self.offsets[ri];
             for (pi, p) in m.views().enumerate() {
-                let mut provides = p.provides_with_files();
+                let mut provides = p.provides_with_files_filtered(required);
                 if let Some(files) = self.extra.get(p.checksum_hex()) {
                     for f in files {
-                        provides.push(Dep::unversioned(f.clone()));
+                        if required.contains(f) {
+                            provides.push(Dep::unversioned(f.clone()));
+                        }
                     }
                 }
                 let requires = p.requires();
@@ -196,6 +198,23 @@ impl CandidateSource for MetasSource<'_> {
                     provides: &provides,
                     requires: &requires,
                     recommends: &recommends,
+                });
+            }
+        }
+    }
+
+    fn scan_names(&self, visit: &mut dyn FnMut(NameView<'_>)) {
+        for m in self.metas {
+            for p in m.views() {
+                let provide_names = p.provide_names();
+                let require_names = p.require_names();
+                let recommend_names = p.recommend_names();
+                visit(NameView {
+                    name: p.name(),
+                    arch: p.arch(),
+                    provide_names: &provide_names,
+                    require_names: &require_names,
+                    recommend_names: &recommend_names,
                 });
             }
         }
@@ -234,8 +253,11 @@ fn unmet_file_requires_views(
     for m in metas {
         for p in m.views() {
             providable.insert(p.name().to_string());
-            for pr in p.provides_with_files() {
-                providable.insert(pr.name);
+            for n in p.provide_names() {
+                providable.insert(n.to_string());
+            }
+            for n in p.file_names() {
+                providable.insert(n.to_string());
             }
         }
     }
@@ -245,9 +267,9 @@ fn unmet_file_requires_views(
     let mut wanted = HashSet::new();
     for m in metas {
         for p in m.views() {
-            for r in p.requires() {
-                if r.name.starts_with('/') && !providable.contains(&r.name) {
-                    wanted.insert(r.name);
+            for r in p.require_names() {
+                if r.starts_with('/') && !providable.contains(r) {
+                    wanted.insert(r.to_string());
                 }
             }
         }
