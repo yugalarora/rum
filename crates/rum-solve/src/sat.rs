@@ -35,6 +35,49 @@ use crate::resolve::{Candidate, ResolveError, Resolved};
 use crate::richdep::{self, RichExpr};
 use crate::{Dep, Evr};
 
+/// A borrowed view of one candidate package, valid only for the duration of a
+/// single visit. This lets the solver read package data (name, deps) straight
+/// from a caller's zero-copy store (e.g. rum-repo's mmap'd metadata) without
+/// materializing an owned `Candidate` for every package — essential for large
+/// repos on small hosts.
+pub struct CandidateRef<'a> {
+    /// Caller-defined handle (e.g. a global package index) echoed back in the
+    /// resolved set.
+    pub id: usize,
+    pub name: &'a str,
+    pub arch: &'a str,
+    pub evr: Evr,
+    pub provides: &'a [Dep],
+    pub requires: &'a [Dep],
+    pub recommends: &'a [Dep],
+}
+
+/// A source of candidates that can be scanned repeatedly without holding them
+/// all in memory at once. `scan` invokes `visit` once per candidate; the solver
+/// scans a few times (requested-name lookup, providable/required sets, pool
+/// build), so implementations must be cheap to re-iterate.
+pub trait CandidateSource {
+    fn scan(&self, visit: &mut dyn FnMut(CandidateRef<'_>));
+}
+
+/// A slice of owned `Candidate`s is a trivial source (used by tests and the
+/// greedy path). Its `id` is the candidate's own `id` field.
+impl CandidateSource for [Candidate] {
+    fn scan(&self, visit: &mut dyn FnMut(CandidateRef<'_>)) {
+        for c in self {
+            visit(CandidateRef {
+                id: c.id,
+                name: &c.name,
+                arch: &c.arch,
+                evr: c.evr.clone(),
+                provides: &c.provides,
+                requires: &c.requires,
+                recommends: &c.recommends,
+            });
+        }
+    }
+}
+
 struct RpmProvider {
     pool: Pool<Ranges<Evr>>,
     /// capability NameId -> solvables providing it (repo + installed synthetic)
@@ -286,8 +329,8 @@ fn version_set(
 /// solvable count bounded we only materialize capabilities that are actually
 /// required by something (`required`) — the vast majority of provides/files are
 /// never depended upon.
-fn build(
-    candidates: &[Candidate],
+fn build<S: CandidateSource + ?Sized>(
+    source: &S,
     installed_provides: &[(String, Option<Evr>)],
     required: &HashSet<String>,
     include_recommends: bool,
@@ -306,14 +349,15 @@ fn build(
     let installed_names: HashSet<String> =
         installed_provides.iter().map(|(n, _)| n.clone()).collect();
 
-    for (ci, c) in candidates.iter().enumerate() {
+    source.scan(&mut |c| {
+        let ci = c.id;
         // Build the package's requirements once; every provider solvable for
         // this package shares them, so selecting the package via *any*
         // capability pulls its dependencies.
         let mut reqs: Vec<ConditionalRequirement> = Vec::new();
         // Hard requires, including rich/boolean deps (parsed into conditional
         // requirements / unions).
-        for r in &c.requires {
+        for r in c.requires {
             if is_ignorable_dep(&r.name) {
                 continue;
             }
@@ -339,7 +383,7 @@ fn build(
         // Weak deps (Recommends): simple, providable ones, installed as if
         // required (dnf default). Rich recommends are rare and skipped.
         if include_recommends {
-            for r in &c.recommends {
+            for r in c.recommends {
                 if is_ignorable_dep(&r.name) || richdep::is_rich(&r.name) {
                     continue;
                 }
@@ -356,8 +400,8 @@ fn build(
         // EVR) plus every Provides / file. A Provides with no version is
         // unversioned and matches any require (tracked as a wildcard).
         let mut caps: Vec<(&str, Option<&Evr>)> = Vec::with_capacity(c.provides.len() + 1);
-        caps.push((c.name.as_str(), Some(&c.evr)));
-        for p in &c.provides {
+        caps.push((c.name, Some(&c.evr)));
+        for p in c.provides {
             caps.push((p.name.as_str(), p.evr.as_ref()));
         }
 
@@ -381,7 +425,7 @@ fn build(
             }
             providers.entry(cap).or_default().push(sid);
         }
-    }
+    });
 
     // Installed capabilities as preferred, dependency-free synthetic solvables
     // (only for capabilities that are required, and matching the same-name rule
@@ -520,29 +564,43 @@ pub fn resolve_sat(
     candidates: &[Candidate],
     installed_provides: &[(String, Option<Evr>)],
 ) -> Result<Resolved, ResolveError> {
+    resolve_sat_with(requested, candidates, installed_provides)
+}
+
+/// Resolve against a [`CandidateSource`] (e.g. rum-repo's zero-copy views), so
+/// the full package set need never be materialized as owned `Candidate`s.
+pub fn resolve_sat_with<S: CandidateSource + ?Sized>(
+    requested: &[String],
+    source: &S,
+    installed_provides: &[(String, Option<Evr>)],
+) -> Result<Resolved, ResolveError> {
     // Resolve requested specs (name or name.arch) to package names up front.
     let mut requested_names = Vec::new();
     for spec in requested {
-        let name = candidates
-            .iter()
-            .find(|c| c.name == *spec || format!("{}.{}", c.name, c.arch) == *spec)
-            .map(|c| c.name.clone())
-            .ok_or_else(|| ResolveError::NotFound(spec.clone()))?;
+        let mut found: Option<String> = None;
+        source.scan(&mut |c| {
+            if found.is_none() && (c.name == spec || format!("{}.{}", c.name, c.arch) == *spec) {
+                found = Some(c.name.to_string());
+            }
+        });
+        let name = found.ok_or_else(|| ResolveError::NotFound(spec.clone()))?;
         if !requested_names.contains(&name) {
             requested_names.push(name);
         }
     }
 
-    // Every capability that anything can provide (package names + provides +
-    // files + installed). A Recommends is only pulled if its capability is in
-    // here — otherwise it's silently dropped (matching dnf).
+    // Every capability a Recommends could point at (package names + versioned
+    // provides + installed). File provides (`/...`) are excluded: they never
+    // back a weak dep and would balloon this set on RHEL-scale metadata.
     let mut providable: HashSet<String> = HashSet::new();
-    for c in candidates {
-        providable.insert(c.name.clone());
-        for p in &c.provides {
-            providable.insert(p.name.clone());
+    source.scan(&mut |c| {
+        providable.insert(c.name.to_string());
+        for p in c.provides {
+            if !p.name.starts_with('/') {
+                providable.insert(p.name.clone());
+            }
         }
-    }
+    });
     for (name, _) in installed_provides {
         providable.insert(name.clone());
     }
@@ -552,7 +610,7 @@ pub fn resolve_sat(
     match attempt(
         requested,
         &requested_names,
-        candidates,
+        source,
         installed_provides,
         &providable,
         true,
@@ -560,7 +618,7 @@ pub fn resolve_sat(
         Err(ResolveError::Unsatisfied { .. }) => attempt(
             requested,
             &requested_names,
-            candidates,
+            source,
             installed_provides,
             &providable,
             false,
@@ -569,10 +627,10 @@ pub fn resolve_sat(
     }
 }
 
-fn attempt(
+fn attempt<S: CandidateSource + ?Sized>(
     requested: &[String],
     requested_names: &[String],
-    candidates: &[Candidate],
+    source: &S,
     installed_provides: &[(String, Option<Evr>)],
     providable: &HashSet<String>,
     include_recommends: bool,
@@ -580,8 +638,8 @@ fn attempt(
     // Capabilities to materialize: everything hard-required, the requested
     // names, and (when on) the satisfiable Recommends.
     let mut required: HashSet<String> = HashSet::new();
-    for c in candidates {
-        for r in &c.requires {
+    source.scan(&mut |c| {
+        for r in c.requires {
             if is_ignorable_dep(&r.name) {
                 continue;
             }
@@ -595,7 +653,7 @@ fn attempt(
             required.insert(r.name.clone());
         }
         if include_recommends {
-            for r in &c.recommends {
+            for r in c.recommends {
                 if !is_ignorable_dep(&r.name)
                     && !richdep::is_rich(&r.name)
                     && providable.contains(&r.name)
@@ -604,13 +662,13 @@ fn attempt(
                 }
             }
         }
-    }
+    });
     for n in requested_names {
         required.insert(n.clone());
     }
 
     let provider = build(
-        candidates,
+        source,
         installed_provides,
         &required,
         include_recommends,

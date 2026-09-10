@@ -138,6 +138,12 @@ impl RepoMetadata {
         self.store().to_owned_packages()
     }
 
+    /// Rehydrate a single package by its index within this repo (to materialize
+    /// only the resolver's winning set).
+    pub fn rehydrate(&self, idx: usize) -> Option<AvailablePackage> {
+        self.store().package_at(idx)
+    }
+
     pub fn len(&self) -> usize {
         self.len
     }

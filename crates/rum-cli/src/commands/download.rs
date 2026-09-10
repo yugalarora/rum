@@ -4,12 +4,12 @@
 //! closure with --resolve), then downloads the RPMs in parallel, verifying each
 //! against its repo checksum. Does not install anything.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use super::repo_sync;
-use rum_repo::{AvailablePackage, Http};
-use rum_solve::{resolve_sat, Candidate, Dep, Evr};
+use rum_repo::{AvailablePackage, Http, RepoMetadata};
+use rum_solve::{resolve_sat_with, CandidateRef, CandidateSource, Dep, Evr};
 
 pub fn run(packages: &[String], with_deps: bool, destdir: &Path) -> anyhow::Result<()> {
     if packages.is_empty() {
@@ -82,114 +82,177 @@ pub fn resolve_packages(packages: &[String], with_deps: bool) -> anyhow::Result<
         }
     }
 
-    let mut pkgs = synced.owned_packages();
-    let base_urls = synced.base_urls;
-    let clients = synced.clients;
+    // Resolve against the repos' zero-copy views (no owned Vec of the whole
+    // package set), then materialize only the winning packages. `gid` is a
+    // global package index; `offsets[ri]..offsets[ri+1]` is repo ri's range.
+    let (packages_out, ids) = {
+        let metas = synced.metas();
+        let mut offsets = Vec::with_capacity(metas.len() + 1);
+        let mut acc = 0usize;
+        for m in metas {
+            offsets.push(acc);
+            acc += m.len();
+        }
+        offsets.push(acc);
 
-    if !with_deps {
-        let mut ids = Vec::new();
-        for spec in packages {
-            match best_match(spec, &pkgs) {
-                Some(i) if !ids.contains(&i) => ids.push(i),
-                Some(_) => {}
-                None => anyhow::bail!("no package found matching `{spec}`"),
+        let rehydrate = |gid: usize| -> Option<AvailablePackage> {
+            let ri = offsets.partition_point(|&o| o <= gid).saturating_sub(1);
+            metas.get(ri).and_then(|m| m.rehydrate(gid - offsets[ri]))
+        };
+
+        let winner_gids: Vec<usize> = if !with_deps {
+            let mut gids = Vec::new();
+            for spec in packages {
+                match best_match_views(spec, metas, &offsets) {
+                    Some(g) if !gids.contains(&g) => gids.push(g),
+                    Some(_) => {}
+                    None => anyhow::bail!("no package found matching `{spec}`"),
+                }
+            }
+            gids
+        } else {
+            let installed = installed_provides();
+            // Extra file provides discovered via the filelists fallback, keyed
+            // by pkgid (primary checksum); injected into the source on retry.
+            let mut extra: HashMap<String, Vec<String>> = HashMap::new();
+            let first = {
+                let src = MetasSource {
+                    metas,
+                    offsets: &offsets,
+                    extra: &extra,
+                };
+                resolve_sat_with(packages, &src, &installed)
+            };
+            match first {
+                Ok(r) => r.to_install,
+                Err(e) => {
+                    // A file-path requirement may only be satisfiable via
+                    // filelists.xml (not primary). Fetch those paths, attach as
+                    // extra provides on their owning packages, and retry once.
+                    let wanted = unmet_file_requires_views(metas, &installed);
+                    if wanted.is_empty() {
+                        return Err(anyhow::anyhow!("dependency resolution failed: {e}"));
+                    }
+                    for (pkgid, files) in repo_sync::load_filelists(&wanted) {
+                        extra.entry(pkgid).or_default().extend(files);
+                    }
+                    let src = MetasSource {
+                        metas,
+                        offsets: &offsets,
+                        extra: &extra,
+                    };
+                    resolve_sat_with(packages, &src, &installed)
+                        .map_err(|e| anyhow::anyhow!("dependency resolution failed: {e}"))?
+                        .to_install
+                }
+            }
+        };
+
+        let mut pkgs = Vec::with_capacity(winner_gids.len());
+        for g in winner_gids {
+            if let Some(p) = rehydrate(g) {
+                pkgs.push(p);
             }
         }
-        return Ok(Resolution {
-            packages: pkgs,
-            base_urls,
-            clients,
-            ids,
-        });
-    }
-
-    let installed = installed_provides();
-    let first = {
-        let candidates = build_candidates(&pkgs);
-        resolve_sat(packages, &candidates, &installed)
-    };
-
-    let ids = match first {
-        Ok(r) => r.to_install,
-        Err(e) => {
-            // Resolution failed. If any file-path requirement is unmet, its
-            // owner's path may only be in filelists.xml (not primary). Fetch
-            // filelists for the wanted paths, attach them, and retry once.
-            let wanted = unmet_file_requires(&pkgs, &installed);
-            if wanted.is_empty() {
-                return Err(anyhow::anyhow!("dependency resolution failed: {e}"));
-            }
-            augment_with_filelists(&mut pkgs, &wanted);
-            let candidates = build_candidates(&pkgs);
-            resolve_sat(packages, &candidates, &installed)
-                .map_err(|e| anyhow::anyhow!("dependency resolution failed: {e}"))?
-                .to_install
-        }
+        let ids = (0..pkgs.len()).collect::<Vec<_>>();
+        (pkgs, ids)
     };
 
     Ok(Resolution {
-        packages: pkgs,
-        base_urls,
-        clients,
+        packages: packages_out,
+        base_urls: synced.base_urls,
+        clients: synced.clients,
         ids,
     })
 }
 
-fn build_candidates(pkgs: &[AvailablePackage]) -> Vec<Candidate> {
-    pkgs.iter()
-        .enumerate()
-        .map(|(i, p)| to_candidate(i, p))
-        .collect()
+/// A [`CandidateSource`] over the synced repos' zero-copy views. Reads package
+/// data straight from the mmap'd metadata; the only owned allocations per
+/// candidate are the transient `Dep` vectors, dropped after each visit.
+struct MetasSource<'a> {
+    metas: &'a [RepoMetadata],
+    offsets: &'a [usize],
+    extra: &'a HashMap<String, Vec<String>>,
 }
 
-/// File-path requirements (`/...`) across all packages that nothing currently
-/// provides (via primary provides/files or the installed system).
-fn unmet_file_requires(
-    pkgs: &[AvailablePackage],
-    installed: &[(String, Option<Evr>)],
-) -> std::collections::HashSet<String> {
-    use std::collections::HashSet;
-    let mut providable: HashSet<&str> = HashSet::new();
-    for p in pkgs {
-        providable.insert(p.name.as_str());
-        for pr in &p.provides {
-            providable.insert(pr.name.as_str());
+impl CandidateSource for MetasSource<'_> {
+    fn scan(&self, visit: &mut dyn FnMut(CandidateRef<'_>)) {
+        for (ri, m) in self.metas.iter().enumerate() {
+            let base = self.offsets[ri];
+            for (pi, p) in m.views().enumerate() {
+                let mut provides = p.provides_with_files();
+                if let Some(files) = self.extra.get(p.checksum_hex()) {
+                    for f in files {
+                        provides.push(Dep::unversioned(f.clone()));
+                    }
+                }
+                let requires = p.requires();
+                let recommends = p.recommends();
+                visit(CandidateRef {
+                    id: base + pi,
+                    name: p.name(),
+                    arch: p.arch(),
+                    evr: p.evr_cmp(),
+                    provides: &provides,
+                    requires: &requires,
+                    recommends: &recommends,
+                });
+            }
         }
-        for f in &p.files {
-            providable.insert(f.as_str());
+    }
+}
+
+/// Highest-EVR package matching `spec` (name or name.arch) across all repos,
+/// returned as a global index.
+fn best_match_views(spec: &str, metas: &[RepoMetadata], offsets: &[usize]) -> Option<usize> {
+    let mut best: Option<(usize, Evr)> = None;
+    for (ri, m) in metas.iter().enumerate() {
+        for (pi, p) in m.views().enumerate() {
+            if p.name() == spec || p.name_arch() == spec {
+                let evr = p.evr_cmp();
+                let better = match &best {
+                    Some((_, b)) => evr > *b,
+                    None => true,
+                };
+                if better {
+                    best = Some((offsets[ri] + pi, evr));
+                }
+            }
+        }
+    }
+    best.map(|(g, _)| g)
+}
+
+/// File-path requirements (`/...`) that nothing provides via primary
+/// provides/files or the installed system — candidates for the filelists
+/// fallback.
+fn unmet_file_requires_views(
+    metas: &[RepoMetadata],
+    installed: &[(String, Option<Evr>)],
+) -> HashSet<String> {
+    let mut providable: HashSet<String> = HashSet::new();
+    for m in metas {
+        for p in m.views() {
+            providable.insert(p.name().to_string());
+            for pr in p.provides_with_files() {
+                providable.insert(pr.name);
+            }
         }
     }
     for (n, _) in installed {
-        providable.insert(n.as_str());
+        providable.insert(n.clone());
     }
     let mut wanted = HashSet::new();
-    for p in pkgs {
-        for r in &p.requires {
-            if r.name.starts_with('/') && !providable.contains(r.name.as_str()) {
-                wanted.insert(r.name.clone());
+    for m in metas {
+        for p in m.views() {
+            for r in p.requires() {
+                if r.name.starts_with('/') && !providable.contains(&r.name) {
+                    wanted.insert(r.name);
+                }
             }
         }
     }
     wanted
-}
-
-/// Fetch filelists for the wanted paths and attach them to the owning packages
-/// (matched by pkgid == primary checksum), so file deps resolve on retry.
-fn augment_with_filelists(
-    pkgs: &mut [AvailablePackage],
-    wanted: &std::collections::HashSet<String>,
-) {
-    let by_pkgid: HashMap<String, usize> = pkgs
-        .iter()
-        .enumerate()
-        .map(|(i, p)| (p.checksum.hex.clone(), i))
-        .collect();
-
-    for (pkgid, files) in repo_sync::load_filelists(wanted) {
-        if let Some(&i) = by_pkgid.get(&pkgid) {
-            pkgs[i].files.extend(files);
-        }
-    }
 }
 
 /// Download a resolved set to `destdir`, verifying checksums.
@@ -295,24 +358,6 @@ fn download_one(http: &Http, job: &Job) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Convert a repo package into a resolver candidate: provides come from the
-/// package's Provides plus its advertised files (which satisfy file deps).
-fn to_candidate(id: usize, p: &AvailablePackage) -> Candidate {
-    let mut provides = p.provides.clone();
-    for f in &p.files {
-        provides.push(Dep::unversioned(f.clone()));
-    }
-    Candidate {
-        id,
-        name: p.name.clone(),
-        arch: p.arch.clone(),
-        evr: Evr::new(Some(p.epoch), p.version.clone(), p.release.clone()),
-        provides,
-        requires: p.requires.clone(),
-        recommends: p.recommends.clone(),
-    }
-}
-
 /// Installed provides (capabilities + files) as (name, optional EVR).
 fn installed_provides() -> Vec<(String, Option<Evr>)> {
     match rum_rpm::Rpmdb::open() {
@@ -323,20 +368,6 @@ fn installed_provides() -> Vec<(String, Option<Evr>)> {
             .collect(),
         Err(_) => Vec::new(),
     }
-}
-
-fn best_match(spec: &str, pkgs: &[AvailablePackage]) -> Option<usize> {
-    pkgs.iter()
-        .enumerate()
-        .filter(|(_, p)| p.name == spec || p.name_arch() == *spec)
-        .max_by(|(_, a), (_, b)| {
-            Evr::new(Some(a.epoch), a.version.clone(), a.release.clone()).compare(&Evr::new(
-                Some(b.epoch),
-                b.version.clone(),
-                b.release.clone(),
-            ))
-        })
-        .map(|(i, _)| i)
 }
 
 fn join_url(base: &str, href: &str) -> String {

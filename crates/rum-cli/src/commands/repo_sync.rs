@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
-use rum_repo::{AvailablePackage, Http, RepoMetadata, SyncOptions};
+use rum_repo::{Http, RepoMetadata, SyncOptions};
 
 use crate::sys;
 
@@ -27,16 +27,6 @@ impl Synced {
     /// Zero-copy view of every synced repo's archived packages.
     pub fn metas(&self) -> &[RepoMetadata] {
         &self.metas
-    }
-
-    /// Materialize all packages, aggregated across repos, as owned values.
-    /// Used by the resolve/download path (which indexes and mutates them).
-    pub fn owned_packages(&self) -> Vec<AvailablePackage> {
-        let mut v = Vec::new();
-        for m in &self.metas {
-            v.extend(m.to_owned_packages());
-        }
-        v
     }
 }
 

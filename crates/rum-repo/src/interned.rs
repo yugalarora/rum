@@ -165,6 +165,40 @@ impl<'a> PkgView<'a> {
     pub fn evr_cmp(&self) -> Evr {
         Evr::new(Some(self.epoch()), self.version(), self.release())
     }
+    pub fn checksum_hex(&self) -> &'a str {
+        self.s(self.pkg.checksum_hex.to_native())
+    }
+
+    /// Owned `Dep`s for the resolver's hard requires.
+    pub fn requires(&self) -> Vec<Dep> {
+        self.pkg
+            .requires
+            .iter()
+            .map(|d| self.store.dep(d))
+            .collect()
+    }
+    /// Owned `Dep`s for weak (Recommends) deps.
+    pub fn recommends(&self) -> Vec<Dep> {
+        self.pkg
+            .recommends
+            .iter()
+            .map(|d| self.store.dep(d))
+            .collect()
+    }
+    /// Provides plus advertised files (as unversioned provides) — the capability
+    /// set the resolver registers, matching the download path's candidates.
+    pub fn provides_with_files(&self) -> Vec<Dep> {
+        let mut v: Vec<Dep> = self
+            .pkg
+            .provides
+            .iter()
+            .map(|d| self.store.dep(d))
+            .collect();
+        for f in self.pkg.files.iter() {
+            v.push(Dep::unversioned(self.s(f.to_native())));
+        }
+        v
+    }
 }
 
 // --- Materialize owned `AvailablePackage`s (resolve/download path) ----------
@@ -173,6 +207,12 @@ impl ArchivedStore {
     /// Resolve every archived package into an owned [`AvailablePackage`].
     pub fn to_owned_packages(&self) -> Vec<crate::AvailablePackage> {
         self.packages.iter().map(|p| self.owned(p)).collect()
+    }
+
+    /// Rehydrate a single package by index (used to materialize only the
+    /// resolver's winning set, not the whole repo).
+    pub fn package_at(&self, idx: usize) -> Option<crate::AvailablePackage> {
+        self.packages.get(idx).map(|p| self.owned(p))
     }
 
     fn owned(&self, p: &ArchivedIPackage) -> crate::AvailablePackage {
