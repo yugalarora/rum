@@ -31,6 +31,29 @@ pub fn decompress(location: &str, data: &[u8]) -> Result<Vec<u8>, DecompressErro
     }
 }
 
+/// A streaming decompressor over in-memory compressed `data`, chosen by the
+/// `location` suffix. Lets callers parse huge files (e.g. filelists.xml)
+/// without materializing the full decompressed content in memory.
+pub fn reader<'a>(
+    location: &str,
+    data: &'a [u8],
+) -> Result<Box<dyn std::io::Read + 'a>, DecompressError> {
+    let lower = location.to_ascii_lowercase();
+    if lower.ends_with(".gz") {
+        Ok(Box::new(flate2::read::GzDecoder::new(data)))
+    } else if lower.ends_with(".zst") || lower.ends_with(".zstd") {
+        let dec = ruzstd::StreamingDecoder::new(data)
+            .map_err(|e| DecompressError::Zstd(e.to_string()))?;
+        Ok(Box::new(dec))
+    } else if lower.ends_with(".xz") {
+        // lzma-rs has no streaming reader; decode once, then stream from memory.
+        let out = unxz(data)?;
+        Ok(Box::new(std::io::Cursor::new(out)))
+    } else {
+        Ok(Box::new(data))
+    }
+}
+
 fn gunzip(data: &[u8]) -> Result<Vec<u8>, DecompressError> {
     let mut out = Vec::new();
     flate2::read::GzDecoder::new(data)

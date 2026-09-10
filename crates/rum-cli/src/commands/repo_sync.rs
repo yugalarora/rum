@@ -92,3 +92,24 @@ pub fn sync_enabled(force_refresh: bool) -> anyhow::Result<Synced> {
         elapsed,
     })
 }
+
+/// Lazily load file ownership from every enabled repo's filelists.xml, filtered
+/// to `wanted` paths. Used as a fallback when a resolve fails on a file-based
+/// dependency whose path is not in primary.xml. Returns `(pkgid, files)`.
+pub fn load_filelists(wanted: &std::collections::HashSet<String>) -> Vec<(String, Vec<String>)> {
+    let Ok(config) = sys::load_config() else {
+        return Vec::new();
+    };
+    let opts = SyncOptions {
+        cachedir: sys::effective_cachedir(&config.main.cachedir),
+        force_refresh: false,
+    };
+    let mut out = Vec::new();
+    for r in config.enabled_repos() {
+        match rum_repo::load_filelists(r, &opts, wanted) {
+            Ok(mut entries) => out.append(&mut entries),
+            Err(e) => tracing::warn!(repo = %r.id, "filelists load failed: {e}"),
+        }
+    }
+    out
+}

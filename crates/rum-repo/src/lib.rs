@@ -14,6 +14,7 @@
 
 mod checksum;
 mod decompress;
+mod filelists;
 mod http;
 mod primary;
 mod repomd;
@@ -165,6 +166,57 @@ pub fn sync_repo(repo: &Repo, opts: &SyncOptions) -> Result<RepoMetadata, RepoEr
         from_cache: false,
         base_url: base,
     })
+}
+
+/// Lazily load file ownership from a repo's `filelists.xml`, filtered to
+/// `wanted` file paths. Returns `(pkgid, files)` where `pkgid` matches an
+/// `AvailablePackage::checksum.hex`. Uses the cached repomd.xml + base URL from
+/// a prior [`sync_repo`]; downloads and caches filelists.xml on first use.
+///
+/// This is the fallback for file-based dependencies whose paths are not in
+/// `primary.xml` (createrepo's core-files filter). It is only called when a
+/// resolve fails on such a path, so the large filelists file is never fetched
+/// on the warm path.
+pub fn load_filelists(
+    repo: &Repo,
+    opts: &SyncOptions,
+    wanted: &std::collections::HashSet<String>,
+) -> Result<Vec<(String, Vec<String>)>, RepoError> {
+    let dir = opts.cachedir.join(&repo.id);
+    let repomd_bytes = read_file(&dir.join("repomd.xml"))?;
+    let md = RepoMd::parse(&String::from_utf8_lossy(&repomd_bytes))?;
+    let entry = md.get("filelists").ok_or_else(|| RepoError::NoPrimary {
+        repo: repo.id.clone(),
+    })?;
+
+    // Cache the *compressed* filelists (tens of MB) rather than the decompressed
+    // form (~100MB+); we stream-decompress+parse it so it's never fully in RAM.
+    let cache = dir.join("filelists.cache");
+    let compressed = match std::fs::read(&cache) {
+        Ok(bytes) if entry.checksum.verify(&bytes) => bytes,
+        _ => {
+            let baseurl_path = dir.join("baseurl");
+            let base_url =
+                std::fs::read_to_string(&baseurl_path).map_err(|source| RepoError::Io {
+                    path: baseurl_path,
+                    source,
+                })?;
+            let http = Http::for_repo(repo)?;
+            let url = join_url(base_url.trim(), &entry.location);
+            let bytes = http.get_bytes(&url)?;
+            if !entry.checksum.verify(&bytes) {
+                return Err(RepoError::ChecksumMismatch {
+                    repo: repo.id.clone(),
+                    file: entry.location.clone(),
+                });
+            }
+            let _ = std::fs::write(&cache, &bytes);
+            bytes
+        }
+    };
+
+    let reader = decompress::reader(&entry.location, &compressed)?;
+    filelists::parse(reader, wanted)
 }
 
 /// Sync many repos in parallel. Returns one result per repo (in the input

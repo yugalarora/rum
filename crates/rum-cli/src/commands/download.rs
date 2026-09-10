@@ -73,26 +73,14 @@ pub struct Fetched {
 /// Resolve `packages` (optionally with their dependency closure) against the
 /// enabled repos. Does NOT download anything.
 pub fn resolve_packages(packages: &[String], with_deps: bool) -> anyhow::Result<Resolution> {
-    let synced = repo_sync::sync_enabled(false)?;
+    let mut synced = repo_sync::sync_enabled(false)?;
     for r in &synced.repos {
         if let Some(e) = &r.error {
             eprintln!("warning: repo `{}` skipped: {e}", r.id);
         }
     }
 
-    let candidates: Vec<Candidate> = synced
-        .packages
-        .iter()
-        .enumerate()
-        .map(|(i, p)| to_candidate(i, p))
-        .collect();
-
-    let ids: Vec<usize> = if with_deps {
-        let installed = installed_provides();
-        resolve_sat(packages, &candidates, &installed)
-            .map_err(|e| anyhow::anyhow!("dependency resolution failed: {e}"))?
-            .to_install
-    } else {
+    if !with_deps {
         let mut ids = Vec::new();
         for spec in packages {
             match best_match(spec, &synced.packages) {
@@ -101,10 +89,95 @@ pub fn resolve_packages(packages: &[String], with_deps: bool) -> anyhow::Result<
                 None => anyhow::bail!("no package found matching `{spec}`"),
             }
         }
-        ids
+        return Ok(Resolution { synced, ids });
+    }
+
+    let installed = installed_provides();
+    let first = {
+        let candidates = build_candidates(&synced.packages);
+        resolve_sat(packages, &candidates, &installed)
     };
 
-    Ok(Resolution { synced, ids })
+    match first {
+        Ok(r) => Ok(Resolution {
+            synced,
+            ids: r.to_install,
+        }),
+        Err(e) => {
+            // Resolution failed. If any file-path requirement is unmet, its
+            // owner's path may only be in filelists.xml (not primary). Fetch
+            // filelists for the wanted paths, attach them, and retry once.
+            let wanted = unmet_file_requires(&synced.packages, &installed);
+            if wanted.is_empty() {
+                return Err(anyhow::anyhow!("dependency resolution failed: {e}"));
+            }
+            augment_with_filelists(&mut synced, &wanted);
+            let candidates = build_candidates(&synced.packages);
+            let ids = resolve_sat(packages, &candidates, &installed)
+                .map_err(|e| anyhow::anyhow!("dependency resolution failed: {e}"))?
+                .to_install;
+            Ok(Resolution { synced, ids })
+        }
+    }
+}
+
+fn build_candidates(pkgs: &[AvailablePackage]) -> Vec<Candidate> {
+    pkgs.iter()
+        .enumerate()
+        .map(|(i, p)| to_candidate(i, p))
+        .collect()
+}
+
+/// File-path requirements (`/...`) across all packages that nothing currently
+/// provides (via primary provides/files or the installed system).
+fn unmet_file_requires(
+    pkgs: &[AvailablePackage],
+    installed: &[(String, Option<Evr>)],
+) -> std::collections::HashSet<String> {
+    use std::collections::HashSet;
+    let mut providable: HashSet<&str> = HashSet::new();
+    for p in pkgs {
+        providable.insert(p.name.as_str());
+        for pr in &p.provides {
+            providable.insert(pr.name.as_str());
+        }
+        for f in &p.files {
+            providable.insert(f.as_str());
+        }
+    }
+    for (n, _) in installed {
+        providable.insert(n.as_str());
+    }
+    let mut wanted = HashSet::new();
+    for p in pkgs {
+        for r in &p.requires {
+            if r.name.starts_with('/') && !providable.contains(r.name.as_str()) {
+                wanted.insert(r.name.clone());
+            }
+        }
+    }
+    wanted
+}
+
+/// Fetch filelists for the wanted paths and attach them to the owning packages
+/// (matched by pkgid == primary checksum), so file deps resolve on retry.
+fn augment_with_filelists(
+    synced: &mut repo_sync::Synced,
+    wanted: &std::collections::HashSet<String>,
+) {
+    use std::collections::HashMap;
+    let by_pkgid: HashMap<String, usize> = synced
+        .packages
+        .iter()
+        .enumerate()
+        .map(|(i, p)| (p.checksum.hex.clone(), i))
+        .collect();
+
+    for (pkgid, files) in repo_sync::load_filelists(wanted) {
+        if let Some(&i) = by_pkgid.get(&pkgid) {
+            synced.packages[i].files.extend(files);
+        }
+    }
 }
 
 /// Download a resolved set to `destdir`, verifying checksums.
