@@ -82,6 +82,32 @@ pub fn resolve_packages(packages: &[String], with_deps: bool) -> anyhow::Result<
         }
     }
 
+    // Expand any `@group` / `@environment` targets into package names (fed to
+    // the resolver as explicit installs). Plain package specs pass through.
+    let requested: Vec<String> = {
+        let has_group = packages.iter().any(|p| p.starts_with('@'));
+        if !has_group {
+            packages.to_vec()
+        } else {
+            let comps = super::groups::Comps::load(synced.metas());
+            let db = rum_rpm::Rpmdb::open().ok();
+            let mut out = Vec::new();
+            for spec in packages {
+                if let Some(group) = spec.strip_prefix('@') {
+                    match comps.expand(group, db.as_ref()) {
+                        Some(names) if !names.is_empty() => out.extend(names),
+                        Some(_) => eprintln!("warning: group `{spec}` is empty"),
+                        None => anyhow::bail!("no group or environment matching `{spec}`"),
+                    }
+                } else {
+                    out.push(spec.clone());
+                }
+            }
+            out
+        }
+    };
+    let packages: &[String] = &requested;
+
     // Resolve against the repos' zero-copy views (no owned Vec of the whole
     // package set), then materialize only the winning packages. `gid` is a
     // global package index; `offsets[ri]..offsets[ri+1]` is repo ri's range.

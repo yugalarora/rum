@@ -98,6 +98,25 @@ pub fn is_root() -> bool {
     false
 }
 
+/// Return freed heap pages to the OS. glibc's allocator keeps large freed
+/// arenas resident, so after the memory-heavy resolve the RSS stays high; on a
+/// constrained host that leaves too little headroom for the native rpm
+/// transaction (which mmaps/unpacks payloads). Calling this between resolve and
+/// commit lets the transaction start from a low resident set. No-op off glibc.
+#[cfg(all(unix, target_env = "gnu"))]
+pub fn release_free_memory() {
+    extern "C" {
+        fn malloc_trim(pad: usize) -> std::os::raw::c_int;
+    }
+    // SAFETY: malloc_trim is always safe to call; it only releases free memory.
+    unsafe {
+        malloc_trim(0);
+    }
+}
+
+#[cfg(not(all(unix, target_env = "gnu")))]
+pub fn release_free_memory() {}
+
 /// Build a command that runs `prog`, escalating via sudo when not already root
 /// (state-changing rpm operations need write access to the rpmdb).
 pub fn privileged(prog: &str) -> std::process::Command {

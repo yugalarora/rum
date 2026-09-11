@@ -39,6 +39,10 @@ pub fn run(packages: &[String], assume_yes: bool) -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // The resolve just peaked heap usage building the pool; hand freed pages
+    // back to the OS so the native rpm transaction has headroom on small hosts.
+    sys::release_free_memory();
+
     // Download into rum's package cache, then commit.
     let pkgdir = sys::effective_cachedir("/var/cache/rum").join("packages");
     let fetched = download::fetch(&resolution, &pkgdir)?;

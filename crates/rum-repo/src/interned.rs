@@ -83,13 +83,21 @@ impl Interner {
         evr.as_ref().map(|e| self.intern(&e.to_string()))
     }
 
-    /// Finish, materializing the arena in symbol order alongside `packages`.
-    pub fn into_store(self, packages: Vec<IPackage>) -> Store {
+    /// Materialize the interned strings in symbol order (`strings[sym]`).
+    pub fn into_strings(self) -> Vec<String> {
         let mut strings = vec![String::new(); self.rodeo.len()];
         for (sym, text) in self.rodeo.iter() {
             strings[sym.into_usize()] = text.to_owned();
         }
-        Store { strings, packages }
+        strings
+    }
+
+    /// Finish, materializing the arena in symbol order alongside `packages`.
+    pub fn into_store(self, packages: Vec<IPackage>) -> Store {
+        Store {
+            strings: self.into_strings(),
+            packages,
+        }
     }
 }
 
