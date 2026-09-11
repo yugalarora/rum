@@ -98,6 +98,28 @@ pub fn is_root() -> bool {
     false
 }
 
+/// Bound glibc's per-thread malloc arenas to one. rum's parallelism is
+/// I/O-bound (network sync/download), not malloc-bound, so a single arena costs
+/// essentially nothing — but it stops glibc from scattering freed memory across
+/// many arenas that `malloc_trim` can't reclaim. Without this, the resolve
+/// heap stays resident and the in-process rpm transaction OOMs a small host (a
+/// multi-package install peaked 764MB; with this + the trim below, ~236MB).
+/// Call once at startup, before threads spawn. No-op off glibc.
+#[cfg(all(unix, target_env = "gnu"))]
+pub fn bound_malloc_arenas() {
+    extern "C" {
+        fn mallopt(param: std::os::raw::c_int, value: std::os::raw::c_int) -> std::os::raw::c_int;
+    }
+    const M_ARENA_MAX: std::os::raw::c_int = -8;
+    // SAFETY: mallopt is a simple allocator-tuning call, always safe.
+    unsafe {
+        mallopt(M_ARENA_MAX, 1);
+    }
+}
+
+#[cfg(not(all(unix, target_env = "gnu")))]
+pub fn bound_malloc_arenas() {}
+
 /// Return freed heap pages to the OS. glibc's allocator keeps large freed
 /// arenas resident, so after the memory-heavy resolve the RSS stays high; on a
 /// constrained host that leaves too little headroom for the native rpm

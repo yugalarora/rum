@@ -120,6 +120,10 @@ enum GroupAction {
 
 fn main() -> anyhow::Result<()> {
     reset_sigpipe();
+    // Cap glibc malloc arenas before any threads spawn, so the resolve heap can
+    // be reclaimed before the in-process rpm transaction (keeps large installs
+    // within a small host's RAM).
+    sys::bound_malloc_arenas();
     let cli = Cli::parse();
     init_tracing(cli.verbose);
 
