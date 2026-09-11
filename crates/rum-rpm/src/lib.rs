@@ -71,6 +71,40 @@ pub struct Rpmdb {
     ts: ffi::rpmts,
 }
 
+/// Installed packages' reverse dependencies that a transaction can break:
+/// exact `= version` couplings and rich `(A if B)` conditionals.
+#[derive(Default)]
+pub struct ReverseDeps {
+    /// capability -> [(requirer_name, required_evr_string)] for exact `=`.
+    pub exact: std::collections::HashMap<String, Vec<(String, String)>>,
+    /// (requirer_name, rich-expression-string) for rich requires.
+    pub rich: Vec<(String, String)>,
+}
+
+/// If `cap` ends in an rpm ISA-color suffix like `(x86-64)`, `(aarch-64)`, or
+/// `(x86-32)` — i.e. `(<word>-<digits>)` — return the base capability with that
+/// suffix removed; otherwise `None`. Used so an installed pin on the
+/// arch-colored provide (`xz-libs(x86-64)`) is indexed under the bare package
+/// name the lockstep looks up. A soname like `libc.so.6()(64bit)` does not
+/// match (`64bit` has no hyphen) and is left alone.
+// Only called from the Linux-only rpmdb scan; the unit test keeps it live.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn strip_isa_suffix(cap: &str) -> Option<&str> {
+    let base = cap.strip_suffix(')')?;
+    let open = base.rfind('(')?;
+    let inner = &base[open + 1..];
+    let (word, bits) = inner.split_once('-')?;
+    if !word.is_empty()
+        && word.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        && !bits.is_empty()
+        && bits.bytes().all(|b| b.is_ascii_digit())
+    {
+        Some(&base[..open])
+    } else {
+        None
+    }
+}
+
 /// A read-write librpm transaction: install and/or erase elements, then commit
 /// natively via `rpmtsRun` (rpm does its own dependency check, ordering, and
 /// scriptlet execution, writing the rpmdb). This is the native replacement for
@@ -243,24 +277,19 @@ mod imp {
             out
         }
 
-        /// Reverse index of installed packages' *exact* `= version` Requires:
-        /// `capability -> [(requirer_name, required_evr_string)]`. Used to detect
-        /// co-built siblings (e.g. `Requires: NetworkManager =
-        /// %{version}-%{release}`) that a partial upgrade would break, so they
-        /// can be pulled into the same transaction. Built by one full rpmdb scan
+        /// Installed packages' reverse dependencies (exact `= version` couplings
+        /// and rich `(A if B)` conditionals) that a transaction could break, so
+        /// the affected siblings can be pulled in. Built by one full rpmdb scan
         /// (the RPMTAG_REQUIRENAME iterator index does not exist on the sqlite
         /// backend, so we can't query per-capability).
-        pub fn exact_require_index(
-            &self,
-        ) -> std::collections::HashMap<String, Vec<(String, String)>> {
-            let mut map: std::collections::HashMap<String, Vec<(String, String)>> =
-                std::collections::HashMap::new();
+        pub fn installed_reverse_deps(&self) -> super::ReverseDeps {
+            let mut rd = super::ReverseDeps::default();
             // SAFETY: valid ts; iterate every installed header and read its
-            // exact-`=` requires.
+            // exact-`=` and rich requires.
             unsafe {
                 let mi = ffi::rpmtsInitIterator(self.ts, ffi::RPMDBI_PACKAGES, ptr::null(), 0);
                 if mi.is_null() {
-                    return map;
+                    return rd;
                 }
                 loop {
                     let h = ffi::rpmdbNextIterator(mi);
@@ -268,11 +297,11 @@ mod imp {
                         break;
                     }
                     let pkg = get_string(h, ffi::RPMTAG_NAME);
-                    collect_exact_requires(h, &pkg, &mut map);
+                    collect_reverse_requires(h, &pkg, &mut rd);
                 }
                 ffi::rpmdbFreeIterator(mi);
             }
-            map
+            rd
         }
 
         fn iter_with(&self, tag: ffi::rpmTagVal, key: Option<&str>) -> Vec<Package> {
@@ -351,12 +380,9 @@ mod imp {
         out
     }
 
-    /// For every exact-`=` Require in header `h`, record `cap -> (pkg, version)`.
-    unsafe fn collect_exact_requires(
-        h: ffi::Header,
-        pkg: &str,
-        out: &mut std::collections::HashMap<String, Vec<(String, String)>>,
-    ) {
+    /// Record header `h`'s reverse deps: exact-`=` requires as `cap ->
+    /// (pkg, version)`, and rich `(...)` requires as `(pkg, expr)`.
+    unsafe fn collect_reverse_requires(h: ffi::Header, pkg: &str, rd: &mut super::ReverseDeps) {
         let names = ffi::rpmtdNew();
         let flags = ffi::rpmtdNew();
         let vers = ffi::rpmtdNew();
@@ -371,20 +397,41 @@ mod imp {
                     break;
                 }
                 ffi::rpmtdSetIndex(flags, idx);
-                if ffi::rpmtdGetNumber(flags) & ffi::RPMSENSE_SENSE_MASK != ffi::RPMSENSE_EQUAL {
-                    continue; // only exact "="; ignore >=, <=, unversioned
-                }
+                let fl = ffi::rpmtdGetNumber(flags);
                 let np = ffi::rpmtdGetString(names);
                 if np.is_null() {
                     continue;
                 }
-                let cap = CStr::from_ptr(np).to_string_lossy().into_owned();
-                ffi::rpmtdSetIndex(vers, idx);
-                let vp = ffi::rpmtdGetString(vers);
-                if !vp.is_null() {
-                    let ver = CStr::from_ptr(vp).to_string_lossy().into_owned();
-                    if !ver.is_empty() {
-                        out.entry(cap).or_default().push((pkg.to_string(), ver));
+                let name = CStr::from_ptr(np).to_string_lossy().into_owned();
+                // A rich/boolean dep is stored as its whole `(...)` expression in
+                // REQUIRENAME; capability names never start with '(' (and the
+                // RPMSENSE_RICH flag bit is unreliable across rpm versions), so
+                // the leading paren is the robust discriminator.
+                if name.starts_with('(') {
+                    rd.rich.push((pkg.to_string(), name));
+                } else if fl & ffi::RPMSENSE_SENSE_MASK == ffi::RPMSENSE_EQUAL {
+                    ffi::rpmtdSetIndex(vers, idx);
+                    let vp = ffi::rpmtdGetString(vers);
+                    if !vp.is_null() {
+                        let ver = CStr::from_ptr(vp).to_string_lossy().into_owned();
+                        if !ver.is_empty() {
+                            // rpm auto-adds an ISA-colored provide `name(x86-64)`
+                            // and installed siblings often pin THAT form (e.g.
+                            // `xz` needs `xz-libs(x86-64) = ...`). The lockstep
+                            // keys on the bare package name of the upgraded
+                            // winner, so index the require under its ISA-stripped
+                            // base too.
+                            if let Some(base) = super::strip_isa_suffix(&name) {
+                                rd.exact
+                                    .entry(base.to_string())
+                                    .or_default()
+                                    .push((pkg.to_string(), ver.clone()));
+                            }
+                            rd.exact
+                                .entry(name)
+                                .or_default()
+                                .push((pkg.to_string(), ver));
+                        }
                     }
                 }
             }
@@ -782,8 +829,8 @@ impl Rpmdb {
     pub fn all_provides(&self) -> Vec<(String, Option<String>)> {
         Vec::new()
     }
-    pub fn exact_require_index(&self) -> std::collections::HashMap<String, Vec<(String, String)>> {
-        std::collections::HashMap::new()
+    pub fn installed_reverse_deps(&self) -> ReverseDeps {
+        ReverseDeps::default()
     }
 }
 
@@ -832,5 +879,16 @@ mod tests {
         };
         assert_eq!(e.evr(), "2:5.2.15-1.amzn2023");
         assert_eq!(e.nevra(), "bash-2:5.2.15-1.amzn2023.x86_64");
+    }
+
+    #[test]
+    fn isa_suffix_stripping() {
+        assert_eq!(strip_isa_suffix("xz-libs(x86-64)"), Some("xz-libs"));
+        assert_eq!(strip_isa_suffix("glibc(aarch-64)"), Some("glibc"));
+        assert_eq!(strip_isa_suffix("glibc(x86-32)"), Some("glibc"));
+        // Not an ISA color: leave sonames and plain names untouched.
+        assert_eq!(strip_isa_suffix("libc.so.6()(64bit)"), None);
+        assert_eq!(strip_isa_suffix("pkgconfig(foo)"), None);
+        assert_eq!(strip_isa_suffix("xz-libs"), None);
     }
 }

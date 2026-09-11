@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use super::repo_sync;
 use rum_repo::{AvailablePackage, Http, RepoMetadata};
-use rum_solve::{resolve_sat_with, CandidateRef, CandidateSource, Dep, Evr, NameView};
+use rum_solve::{resolve_sat_with, CandidateRef, CandidateSource, Dep, Evr, NameView, RichExpr};
 
 pub fn run(packages: &[String], with_deps: bool, destdir: &Path) -> anyhow::Result<()> {
     if packages.is_empty() {
@@ -225,7 +225,7 @@ pub fn resolve_packages(packages: &[String], with_deps: bool) -> anyhow::Result<
         // into the winner set, to a fixpoint. rpm validates the final set.
         if with_deps {
             if let Ok(db) = rum_rpm::Rpmdb::open() {
-                let index = db.exact_require_index();
+                let rd = db.installed_reverse_deps();
                 let mut seen: HashSet<String> = winners.iter().map(|w| w.name.clone()).collect();
                 let mut queue: Vec<AvailablePackage> = winners.clone();
                 while let Some(w) = queue.pop() {
@@ -234,7 +234,7 @@ pub fn resolve_packages(packages: &[String], with_deps: bool) -> anyhow::Result<
                     if db.by_name(&w.name).is_empty() {
                         continue;
                     }
-                    let Some(requirers) = index.get(&w.name) else {
+                    let Some(requirers) = rd.exact.get(&w.name) else {
                         continue;
                     };
                     for (rqr, reqver) in requirers {
@@ -248,6 +248,65 @@ pub fn resolve_packages(packages: &[String], with_deps: bool) -> anyhow::Result<
                             winners.push(pkg.clone());
                             queue.push(pkg);
                         }
+                    }
+                }
+
+                // Rich reverse-dep augmentation. An installed package may carry a
+                // conditional `(X = V if Y)` require: once Y is present (installed
+                // or being installed), rpm demands X at V. rum's resolver doesn't
+                // model installed packages' rich requires, so satisfy them here by
+                // pulling X. Example: installed `systemd` needs
+                // `(systemd-rpm-macros = ... if rpm-build)`, and `@development`
+                // pulls `rpm-build`, so `systemd-rpm-macros` must come along.
+                // Iterate to a fixpoint (bounded by the finite rich-dep set).
+                loop {
+                    let mut added = false;
+                    for (_rqr, expr) in &rd.rich {
+                        // Only `(then if cond)` / `(then if cond else _)` where both
+                        // sides are plain terms are actionable as a pull.
+                        let (then, cond) = match rum_solve::parse_rich(expr) {
+                            Some(RichExpr::If(t, c)) | Some(RichExpr::IfElse(t, c, _)) => {
+                                match (*t, *c) {
+                                    (RichExpr::Term(t), RichExpr::Term(c)) => (t, c),
+                                    _ => continue,
+                                }
+                            }
+                            _ => continue,
+                        };
+                        // Condition active? (being installed, or already installed)
+                        let cond_active = seen.contains(&cond.name) || db.is_installed(&cond.name);
+                        if !cond_active {
+                            continue;
+                        }
+                        // Already satisfied by a winner or an installed build?
+                        if seen.contains(&then.name) {
+                            continue;
+                        }
+                        let want_evr = then.evr.clone();
+                        let installed_ok = match &want_evr {
+                            Some(v) => db.by_name(&then.name).iter().any(|p| {
+                                &Evr::new(Some(p.epoch.unwrap_or(0)), &p.version, &p.release) == v
+                            }),
+                            None => db.is_installed(&then.name),
+                        };
+                        if installed_ok {
+                            continue;
+                        }
+                        // Pull the provider: the exact build for a versioned `=`,
+                        // else the newest available by name.
+                        let pulled = match &want_evr {
+                            Some(v) => find_pkg_at(&then.name, v, metas),
+                            None => best_match_views(&then.name, metas, &offsets, &arches_for(&[]))
+                                .and_then(rehydrate),
+                        };
+                        if let Some(pkg) = pulled {
+                            seen.insert(then.name.clone());
+                            winners.push(pkg);
+                            added = true;
+                        }
+                    }
+                    if !added {
+                        break;
                     }
                 }
             }
