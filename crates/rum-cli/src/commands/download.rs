@@ -91,19 +91,44 @@ pub fn resolve_packages(packages: &[String], with_deps: bool) -> anyhow::Result<
         } else {
             let comps = super::groups::Comps::load(synced.metas());
             let db = rum_rpm::Rpmdb::open().ok();
-            let mut out = Vec::new();
+            let mut explicit = Vec::new();
+            let mut group_members: Vec<String> = Vec::new();
             for spec in packages {
                 if let Some(group) = spec.strip_prefix('@') {
                     match comps.expand(group, db.as_ref()) {
-                        Some(names) if !names.is_empty() => out.extend(names),
+                        Some(names) if !names.is_empty() => group_members.extend(names),
                         Some(_) => eprintln!("warning: group `{spec}` is empty"),
                         None => anyhow::bail!("no group or environment matching `{spec}`"),
                     }
                 } else {
-                    out.push(spec.clone());
+                    explicit.push(spec.clone());
                 }
             }
-            out
+            // A group can list members not present in the enabled repos (e.g.
+            // AL2023's @development lists `rcs`); dnf silently skips those, so we
+            // drop group members that no repo provides (by name or capability)
+            // rather than failing the whole group. Explicit targets still error.
+            if !group_members.is_empty() {
+                let mut available: HashSet<String> = HashSet::new();
+                for m in synced.metas() {
+                    for p in m.views() {
+                        available.insert(p.name().to_string());
+                        for pr in p.provide_names() {
+                            available.insert(pr.to_string());
+                        }
+                    }
+                }
+                let before = group_members.len();
+                group_members.retain(|n| {
+                    available.contains(n) || db.as_ref().is_some_and(|d| d.is_installed(n))
+                });
+                let dropped = before - group_members.len();
+                if dropped > 0 {
+                    eprintln!("note: skipped {dropped} group package(s) not in the enabled repos");
+                }
+            }
+            explicit.extend(group_members);
+            explicit
         }
     };
     // Resolve against the repos' zero-copy views (no owned Vec of the whole
