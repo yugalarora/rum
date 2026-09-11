@@ -106,25 +106,6 @@ pub fn resolve_packages(packages: &[String], with_deps: bool) -> anyhow::Result<
             out
         }
     };
-    let packages: &[String] = &requested;
-
-    // Multilib policy (dnf's `multilib_policy=best`): only consider packages
-    // for the host arch and `noarch`; secondary arches (e.g. i686 on x86_64)
-    // are excluded from the candidate pool unless a spec explicitly names that
-    // arch (`glibc.i686`). This keeps the resolved set single-arch so the rpm
-    // transaction doesn't hit cross-arch conflicts.
-    let allow_arches: HashSet<String> = {
-        let mut a = HashSet::new();
-        a.insert(std::env::consts::ARCH.to_string()); // host arch rum was built for
-        a.insert("noarch".to_string());
-        for spec in packages {
-            if let Some(arch) = explicit_arch(spec) {
-                a.insert(arch.to_string());
-            }
-        }
-        a
-    };
-
     // Resolve against the repos' zero-copy views (no owned Vec of the whole
     // package set), then materialize only the winning packages. `gid` is a
     // global package index; `offsets[ri]..offsets[ri+1]` is repo ri's range.
@@ -143,32 +124,40 @@ pub fn resolve_packages(packages: &[String], with_deps: bool) -> anyhow::Result<
             metas.get(ri).and_then(|m| m.rehydrate(gid - offsets[ri]))
         };
 
-        let winner_gids: Vec<usize> = if !with_deps {
-            let mut gids = Vec::new();
-            for spec in packages {
-                match best_match_views(spec, metas, &offsets, &allow_arches) {
-                    Some(g) if !gids.contains(&g) => gids.push(g),
-                    Some(_) => {}
-                    None => anyhow::bail!("no package found matching `{spec}`"),
-                }
-            }
-            gids
+        // Installed provides (for the SAT installed-synthetics), computed once.
+        let installed = if with_deps {
+            installed_provides()
         } else {
-            let installed = installed_provides();
-            // Extra file provides discovered via the filelists fallback, keyed
-            // by pkgid (primary checksum); injected into the source on retry.
+            Vec::new()
+        };
+
+        // One resolve pass for a target set (multilib-filtered; SAT with the
+        // filelists fallback, or best-match for a bare download).
+        let resolve_targets = |targets: &[String]| -> anyhow::Result<Vec<usize>> {
+            let allow = arches_for(targets);
+            if !with_deps {
+                let mut gids = Vec::new();
+                for spec in targets {
+                    match best_match_views(spec, metas, &offsets, &allow) {
+                        Some(g) if !gids.contains(&g) => gids.push(g),
+                        Some(_) => {}
+                        None => anyhow::bail!("no package found matching `{spec}`"),
+                    }
+                }
+                return Ok(gids);
+            }
             let mut extra: HashMap<String, Vec<String>> = HashMap::new();
             let first = {
                 let src = MetasSource {
                     metas,
                     offsets: &offsets,
                     extra: &extra,
-                    allow_arches: &allow_arches,
+                    allow_arches: &allow,
                 };
-                resolve_sat_with(packages, &src, &installed)
+                resolve_sat_with(targets, &src, &installed)
             };
             match first {
-                Ok(r) => r.to_install,
+                Ok(r) => Ok(r.to_install),
                 Err(e) => {
                     // A file-path requirement may only be satisfiable via
                     // filelists.xml (not primary). Fetch those paths, attach as
@@ -184,23 +173,63 @@ pub fn resolve_packages(packages: &[String], with_deps: bool) -> anyhow::Result<
                         metas,
                         offsets: &offsets,
                         extra: &extra,
-                        allow_arches: &allow_arches,
+                        allow_arches: &allow,
                     };
-                    resolve_sat_with(packages, &src, &installed)
+                    Ok(resolve_sat_with(targets, &src, &installed)
                         .map_err(|e| anyhow::anyhow!("dependency resolution failed: {e}"))?
-                        .to_install
+                        .to_install)
                 }
             }
         };
 
-        let mut pkgs = Vec::with_capacity(winner_gids.len());
-        for g in winner_gids {
-            if let Some(p) = rehydrate(g) {
-                pkgs.push(p);
+        // Lockstep-upgrade augmentation: an installed package co-built with one
+        // we're upgrading may require it at an EXACT `= version` (e.g.
+        // `NetworkManager-tui` needs the old `NetworkManager`); upgrading only
+        // part of the set makes rpm reject the transaction. Detect such broken
+        // installed requirers via the rpmdb and pull them into the target set,
+        // re-resolving to a fixpoint (bounded), so the whole coupled set
+        // upgrades together — matching dnf.
+        let gids = resolve_targets(&requested)?;
+        let mut winners: Vec<AvailablePackage> = gids.into_iter().filter_map(rehydrate).collect();
+
+        // Lockstep-upgrade augmentation. An installed package we're upgrading may
+        // have installed co-built siblings pinned to it via `= exact-version`
+        // (e.g. NetworkManager-{tui,cloud-setup}); a name target won't upgrade
+        // them (the resolver keeps the installed version), so we pull the repo
+        // build at the SAME new EVR (co-built subpackages share it) directly
+        // into the winner set, to a fixpoint. rpm validates the final set.
+        if with_deps {
+            if let Ok(db) = rum_rpm::Rpmdb::open() {
+                let index = db.exact_require_index();
+                let mut seen: HashSet<String> = winners.iter().map(|w| w.name.clone()).collect();
+                let mut queue: Vec<AvailablePackage> = winners.clone();
+                while let Some(w) = queue.pop() {
+                    let w_evr = Evr::new(Some(w.epoch), w.version.clone(), w.release.clone());
+                    // Only upgrades of installed packages can break a pinned sibling.
+                    if db.by_name(&w.name).is_empty() {
+                        continue;
+                    }
+                    let Some(requirers) = index.get(&w.name) else {
+                        continue;
+                    };
+                    for (rqr, reqver) in requirers {
+                        if seen.contains(rqr) || Evr::parse(reqver) == w_evr {
+                            continue;
+                        }
+                        // The co-built sibling build that pins the NEW version
+                        // shares its EVR; pull that exact one from the repo.
+                        if let Some(pkg) = find_pkg_at(rqr, &w_evr, metas) {
+                            seen.insert(rqr.clone());
+                            winners.push(pkg.clone());
+                            queue.push(pkg);
+                        }
+                    }
+                }
             }
         }
-        let ids = (0..pkgs.len()).collect::<Vec<_>>();
-        (pkgs, ids)
+
+        let ids = (0..winners.len()).collect::<Vec<_>>();
+        (winners, ids)
     };
 
     Ok(Resolution {
@@ -275,6 +304,34 @@ impl CandidateSource for MetasSource<'_> {
             }
         }
     }
+}
+
+/// Allowed package arches for a target set: host arch + noarch, plus any arch
+/// a target explicitly names (`glibc.i686`).
+fn arches_for(targets: &[String]) -> HashSet<String> {
+    let mut a = HashSet::new();
+    a.insert(std::env::consts::ARCH.to_string());
+    a.insert("noarch".to_string());
+    for spec in targets {
+        if let Some(arch) = explicit_arch(spec) {
+            a.insert(arch.to_string());
+        }
+    }
+    a
+}
+
+/// Find the repo package named `name` at exactly EVR `evr` across all repos,
+/// returned as an owned `AvailablePackage` (used to pull a co-built sibling at
+/// the same new version as the package it's pinned to).
+fn find_pkg_at(name: &str, evr: &Evr, metas: &[RepoMetadata]) -> Option<AvailablePackage> {
+    for m in metas {
+        for (pi, p) in m.views().enumerate() {
+            if p.name() == name && &p.evr_cmp() == evr {
+                return m.rehydrate(pi);
+            }
+        }
+    }
+    None
 }
 
 /// The trailing `.arch` of a spec, if it names a known RPM architecture

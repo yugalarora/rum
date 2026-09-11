@@ -243,6 +243,38 @@ mod imp {
             out
         }
 
+        /// Reverse index of installed packages' *exact* `= version` Requires:
+        /// `capability -> [(requirer_name, required_evr_string)]`. Used to detect
+        /// co-built siblings (e.g. `Requires: NetworkManager =
+        /// %{version}-%{release}`) that a partial upgrade would break, so they
+        /// can be pulled into the same transaction. Built by one full rpmdb scan
+        /// (the RPMTAG_REQUIRENAME iterator index does not exist on the sqlite
+        /// backend, so we can't query per-capability).
+        pub fn exact_require_index(
+            &self,
+        ) -> std::collections::HashMap<String, Vec<(String, String)>> {
+            let mut map: std::collections::HashMap<String, Vec<(String, String)>> =
+                std::collections::HashMap::new();
+            // SAFETY: valid ts; iterate every installed header and read its
+            // exact-`=` requires.
+            unsafe {
+                let mi = ffi::rpmtsInitIterator(self.ts, ffi::RPMDBI_PACKAGES, ptr::null(), 0);
+                if mi.is_null() {
+                    return map;
+                }
+                loop {
+                    let h = ffi::rpmdbNextIterator(mi);
+                    if h.is_null() {
+                        break;
+                    }
+                    let pkg = get_string(h, ffi::RPMTAG_NAME);
+                    collect_exact_requires(h, &pkg, &mut map);
+                }
+                ffi::rpmdbFreeIterator(mi);
+            }
+            map
+        }
+
         fn iter_with(&self, tag: ffi::rpmTagVal, key: Option<&str>) -> Vec<Package> {
             let ckey = key.map(|k| CString::new(k).unwrap());
             let (keyp, keylen) = match &ckey {
@@ -317,6 +349,52 @@ mod imp {
         ffi::rpmtdFreeData(vers);
         ffi::rpmtdFree(vers);
         out
+    }
+
+    /// For every exact-`=` Require in header `h`, record `cap -> (pkg, version)`.
+    unsafe fn collect_exact_requires(
+        h: ffi::Header,
+        pkg: &str,
+        out: &mut std::collections::HashMap<String, Vec<(String, String)>>,
+    ) {
+        let names = ffi::rpmtdNew();
+        let flags = ffi::rpmtdNew();
+        let vers = ffi::rpmtdNew();
+        let have_n = ffi::headerGet(h, ffi::RPMTAG_REQUIRENAME, names, 0) != 0;
+        let have_f = ffi::headerGet(h, ffi::RPMTAG_REQUIREFLAGS, flags, 0) != 0;
+        let have_v = ffi::headerGet(h, ffi::RPMTAG_REQUIREVERSION, vers, 0) != 0;
+        if have_n && have_f && have_v {
+            ffi::rpmtdInit(names);
+            loop {
+                let idx = ffi::rpmtdNext(names);
+                if idx < 0 {
+                    break;
+                }
+                ffi::rpmtdSetIndex(flags, idx);
+                if ffi::rpmtdGetNumber(flags) & ffi::RPMSENSE_SENSE_MASK != ffi::RPMSENSE_EQUAL {
+                    continue; // only exact "="; ignore >=, <=, unversioned
+                }
+                let np = ffi::rpmtdGetString(names);
+                if np.is_null() {
+                    continue;
+                }
+                let cap = CStr::from_ptr(np).to_string_lossy().into_owned();
+                ffi::rpmtdSetIndex(vers, idx);
+                let vp = ffi::rpmtdGetString(vers);
+                if !vp.is_null() {
+                    let ver = CStr::from_ptr(vp).to_string_lossy().into_owned();
+                    if !ver.is_empty() {
+                        out.entry(cap).or_default().push((pkg.to_string(), ver));
+                    }
+                }
+            }
+        }
+        ffi::rpmtdFreeData(names);
+        ffi::rpmtdFree(names);
+        ffi::rpmtdFreeData(flags);
+        ffi::rpmtdFree(flags);
+        ffi::rpmtdFreeData(vers);
+        ffi::rpmtdFree(vers);
     }
 
     /// Collect a header's Provides capabilities as (name, optional version).
@@ -703,6 +781,9 @@ impl Rpmdb {
     }
     pub fn all_provides(&self) -> Vec<(String, Option<String>)> {
         Vec::new()
+    }
+    pub fn exact_require_index(&self) -> std::collections::HashMap<String, Vec<(String, String)>> {
+        std::collections::HashMap::new()
     }
 }
 
