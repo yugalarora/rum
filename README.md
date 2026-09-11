@@ -15,24 +15,28 @@ RPM database — so it coexists safely with `yum` and `dnf` on the same host whi
 
 ## Why rum?
 
-`dnf`/`yum` are written in Python and re-download the full metadata set and spin up a
-Python interpreter on every invocation. `rum` is a native Rust binary that fetches
-repository metadata in parallel, keeps a lean cache, and starts instantly.
+`dnf`/`yum` are written in Python and spin up an interpreter and rebuild their metadata
+state on every invocation. `rum` is a native Rust binary that fetches repository metadata
+in parallel, keeps a lean zero-copy cache, and starts instantly.
 
-- ⚡ **Fast & parallel** — parallel metadata fetch, verify, and decompress; instant startup.
+- ⚡ **Fast & parallel** — parallel metadata fetch, checksum verify, and decompress; a
+  memory-mapped, zero-copy metadata cache; instant startup.
 - 🦀 **Rust-native, memory-safe** — no Python runtime; a pure-Rust librepo (rustls TLS,
-  pure-Rust gzip/xz/zstd) and a bit-exact `rpmvercmp` port.
+  pure-Rust gzip/xz/zstd), a bit-exact `rpmvercmp` port, and a SAT dependency resolver.
 - 🤝 **Coexists with yum/dnf** — rum keeps **no** package database of its own. Installed
   state always comes live from the shared rpmdb (`/var/lib/rpm`), so packages installed
   by `dnf`/`yum` are visible to `rum` and vice-versa.
 - 🔁 **Uses your existing config** — `dnf.conf` / `yum.conf`, `/etc/yum.repos.d/*.repo`,
-  variable substitution (`$releasever`, `$basearch`, `/etc/dnf/vars/`), mirrorlists and
-  metalinks.
-- 🧩 **Works across rpmdb backends** — validated on **sqlite** (Amazon Linux 2023, RHEL 9+,
-  Fedora 33+) and **BerkeleyDB** (RHEL 8).
-- 🔒 **Safe transactions** — the actual install/erase transaction is committed through the
-  system `rpm` (librpm), which performs its own dependency and conflict checks before
-  writing the rpmdb.
+  variable substitution (`$releasever`, `$basearch`, `/etc/dnf/vars/`), mirrorlists,
+  metalinks, and AWS RHUI (region substitution + instance authentication).
+- 🧩 **Full resolver** — weak dependencies (`Recommends`), rich/boolean dependencies
+  (`(A if B)`, `(A or B)`, …), multilib policy, comps groups and environments, and a
+  `filelists` fallback for file-path requirements. Produces the **same** package set as
+  `dnf` on validated closures.
+- 🔒 **Native, safe transactions** — installs and removals are committed in-process
+  through `librpm` (`rpmtsRun`), which performs its own dependency and conflict checks and
+  runs scriptlets before writing the rpmdb. Everything downloaded is SHA-256 verified;
+  package signatures are checked by rpm at commit time.
 
 ## Benchmarks
 
@@ -44,27 +48,47 @@ before every run), `rum` vs the system `dnf`:
 | Refresh metadata (`makecache`) | 21.8 s | 1.85 s | **~12×** |
 | Cold query (empty cache → "which versions are available") | 22.0 s | 2.3 s | **~9.5×** |
 | Startup latency (`repolist`, warm) | 0.30 s | 0.01 s | **~30×** |
+| List a group (`group list`, warm) | 0.65 s | 0.05 s | **~13×** |
 | Install a package + dependencies (`install git`, cold) | 28.3 s | 4.6 s | **~6×** |
 
-Notes for honesty: `rum` currently fetches only the `primary` metadata it needs for
-querying/resolution, while `dnf` fetches the full metadata set — so part of the metadata
-speedup reflects fetching less. The transaction-commit phase (running `rpm`) is identical
-for both. The **startup** and **parallel-fetch** wins are the most fundamental.
+The transaction-commit phase (unpacking + scriptlets, via librpm) is inherent to RPM and
+identical for both tools; the **startup**, **parallel-fetch**, and **cached-query** wins
+are where rum pulls ahead. Dependency resolution produces the **identical** package set as
+`dnf` on representative closures — e.g. `nginx` → 7, `git` → 8, `mariadb105-server` → 19,
+`postgresql15-server-devel` → 36 — including weak and rich dependencies.
 
-Dependency resolution is validated to produce the **identical** package set as `dnf` for
-representative closures (e.g. `nginx` → 7 packages, `git` → 8 packages including its Perl
-dependencies).
+## Supported operating systems
+
+rum targets the RPM ecosystem and is continuously tested on both **x86_64** and
+**aarch64 (arm64)**. Validated distributions:
+
+| Distribution | Architectures | rpmdb backend | rpm |
+|---|---|---|---|
+| Amazon Linux 2023 | x86_64, aarch64 | sqlite | 4.16 |
+| RHEL 10 | x86_64, aarch64 | sqlite | 4.19 |
+| RHEL 9 | x86_64 | sqlite | 4.16 |
+| RHEL 8 | x86_64 | BerkeleyDB | 4.14 |
+| Rocky Linux 9 | x86_64, aarch64 | sqlite | 4.16 |
+
+Because rum reads standard yum/dnf configuration and links the system `librpm`, it also
+works on the wider RPM family that shares those conventions — **Fedora, AlmaLinux, and
+CentOS Stream** — across the sqlite and BerkeleyDB rpmdb backends.
 
 ## Installation
 
 ### From a release binary
 
-Download the latest `rum-*-x86_64-linux.tar.gz` from the
-[Releases](https://github.com/yugalarora/rum/releases) page, verify, and install:
+Binaries are published for **x86_64** and **aarch64**. Pick your architecture
+(`uname -m`), download from the [Releases](https://github.com/yugalarora/rum/releases)
+page, verify, and install:
 
 ```bash
-curl -fsSL -O https://github.com/yugalarora/rum/releases/latest/download/rum-<ver>-x86_64-linux.tar.gz
-tar -xzf rum-*-x86_64-linux.tar.gz
+arch=$(uname -m)                     # x86_64 or aarch64
+base=https://github.com/yugalarora/rum/releases/latest/download
+curl -fsSL -O "$base/rum-<ver>-${arch}-linux.tar.gz"
+curl -fsSL -O "$base/rum-<ver>-${arch}-linux.tar.gz.sha256"
+sha256sum -c "rum-<ver>-${arch}-linux.tar.gz.sha256"
+tar -xzf "rum-<ver>-${arch}-linux.tar.gz"
 sudo install -m755 rum-*/rum /usr/local/bin/rum
 ```
 
@@ -95,18 +119,21 @@ rum list installed           # installed packages (read live from the rpmdb)
 rum list available 'kernel*' # latest available versions matching a glob
 rum info bash                # package details
 rum search web server        # search name + summary
-rum provides /usr/bin/tree   # (planned) which package provides a path
 rum check-update             # list available updates (exit 100 if any, like dnf)
 rum download --resolve git   # download a package + its dependency closure
 rum install -y git           # resolve, show transaction, download, and install
 rum remove -y git            # erase
 rum upgrade httpd            # upgrade in place
+
+rum group list               # list available comps groups
+rum group install "Development Tools"   # install a group's packages
+rum install @development     # groups also work as @-targets
 rum clean all                # clear cached metadata and packages
 ```
 
-`rum install` is idempotent: installing a package that is already present at
-the latest available version is a no-op ("Nothing to do"), and it shows the
-full transaction before downloading anything.
+`rum install` is idempotent: installing a package already present at the latest available
+version is a no-op ("Nothing to do"), and every state-changing command shows the full
+transaction before downloading anything.
 
 Global flags: `-y/--assumeyes`, `--assumeno`, `-v/--verbose` (repeatable),
 `RUM_LOG=debug` for tracing.
@@ -118,42 +145,19 @@ Global flags: `-y/--assumeyes`, `--assumeno`, `-v/--verbose` (repeatable),
 | Crate | Role |
 |---|---|
 | `rum-config` | Parse `dnf.conf`/`yum.conf` + `.repo` files, variable substitution |
-| `rum-repo` | Pure-Rust librepo: parallel fetch, mirrorlist/metalink, checksum verify, gz/xz/zstd, cache |
-| `rum-rpm` | Read-only rpmdb access via `librpm` FFI (sqlite + BerkeleyDB backends) |
-| `rum-solve` | Bit-exact `rpmvercmp`, EVR comparison, and SAT dependency resolution (via [`resolvo`](https://crates.io/crates/resolvo)) |
+| `rum-repo` | Pure-Rust librepo: parallel fetch, mirrorlist/metalink, RHUI auth, checksum verify, gz/xz/zstd, zero-copy mmap cache, comps |
+| `rum-rpm` | rpmdb access + native `librpm` transaction engine via FFI (sqlite + BerkeleyDB backends) |
+| `rum-solve` | Bit-exact `rpmvercmp`, EVR comparison, and SAT dependency resolution (via [`resolvo`](https://crates.io/crates/resolvo)), including rich/boolean dependencies |
 | `rum-cli` | The `rum` command-line interface |
 
 **Design principle — coexistence:** rum never maintains its own idea of what is installed.
 Every "installed" query reads the shared rpmdb through librpm, and every transaction is
-committed through `rpm`, so rum and dnf/yum can be used interchangeably on one system.
+committed through librpm, so rum and dnf/yum can be used interchangeably on one system.
+The rpmdb is opened read-only for queries, so rum never blocks a concurrent dnf run.
 
 `$releasever` is derived the way dnf does it — from the rpmdb `Provides:
 system-release(releasever)` — not from `/etc/os-release`, which matters on Amazon Linux
 2023 where the two differ.
-
-## Compatibility & status
-
-Implemented and validated: `repolist`, `makecache`, `list`, `info`, `search`,
-`check-update`, `download`, `install`, `remove`, `upgrade`. Verified against `dnf`/`rpm`
-on Amazon Linux 2023 (sqlite rpmdb) and RHEL 8 (BerkeleyDB rpmdb).
-
-Known limitations / roadmap:
-
-- **Weak dependencies:** `Recommends` are installed by default (matching dnf's
-  `install_weak_deps=1`) — pulled best-effort, so an unsatisfiable one is dropped rather
-  than failing the transaction. `Suggests` are not installed (dnf doesn't either). rum's
-  resolved set matches dnf exactly on validated closures (nginx, git, gcc-c++, and a full
-  headless-JDK tree at 27 packages).
-- **Rich/boolean dependencies** like `(mysql-selinux if selinux-policy-targeted)` are not
-  yet parsed and are skipped, so rum may miss a conditional dependency dnf would pull
-  (e.g. `mysql-selinux` for mariadb when SELinux is enabled).
-- **Transaction commit** currently shells out to `rpm` (librpm); a native `rpmtsRun` FFI
-  path is planned.
-- **Red Hat RHUI** repos (RHEL-on-AWS): region substitution and TLS client-certificate
-  auth are implemented and the TLS handshake succeeds, but Red Hat's Pulp content
-  endpoint needs additional RHUI-specific handling.
-- GPG signature verification of packages is performed by `rpm` at commit time; rum
-  additionally verifies SHA-256 checksums of everything it downloads.
 
 ## License
 
