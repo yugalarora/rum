@@ -93,6 +93,12 @@ enum Command {
     /// Remove packages. [planned]
     Remove { packages: Vec<String> },
 
+    /// Manage package groups / environments (like `dnf group`).
+    Group {
+        #[command(subcommand)]
+        action: GroupAction,
+    },
+
     /// Upgrade packages (all, or the named ones). [planned]
     Upgrade { packages: Vec<String> },
 
@@ -104,8 +110,20 @@ enum Command {
     },
 }
 
+#[derive(Subcommand, Debug)]
+enum GroupAction {
+    /// List available groups.
+    List,
+    /// Install the packages in one or more groups (mandatory + default).
+    Install { groups: Vec<String> },
+}
+
 fn main() -> anyhow::Result<()> {
     reset_sigpipe();
+    // Cap glibc malloc arenas before any threads spawn, so the resolve heap can
+    // be reclaimed before the in-process rpm transaction (keeps large installs
+    // within a small host's RAM).
+    sys::bound_malloc_arenas();
     let cli = Cli::parse();
     init_tracing(cli.verbose);
 
@@ -130,6 +148,23 @@ fn main() -> anyhow::Result<()> {
         } => commands::download::run(&packages, resolve, std::path::Path::new(&destdir)),
         Command::Install { packages } => commands::install::run(&packages, assume_yes),
         Command::Remove { packages } => commands::remove::run(&packages, assume_yes),
+        Command::Group { action } => match action {
+            GroupAction::List => commands::groups::run_list(),
+            GroupAction::Install { groups } => {
+                // Group install == installing each group's `@`-target.
+                let targets: Vec<String> = groups
+                    .iter()
+                    .map(|g| {
+                        if g.starts_with('@') {
+                            g.clone()
+                        } else {
+                            format!("@{g}")
+                        }
+                    })
+                    .collect();
+                commands::install::run(&targets, assume_yes)
+            }
+        },
         Command::Upgrade { packages } if !packages.is_empty() => {
             // `upgrade <pkgs>` is install semantics (rpm -U upgrades in place).
             commands::install::run(&packages, assume_yes)
@@ -198,6 +233,7 @@ impl Command {
             Command::Remove { .. } => "remove",
             Command::Upgrade { .. } => "upgrade",
             Command::Clean { .. } => "clean",
+            Command::Group { .. } => "group",
         }
     }
 }

@@ -33,6 +33,14 @@ pub const RPMTAG_ARCH: rpmTagVal = 1022;
 pub const RPMTAG_INSTALLTIME: rpmTagVal = 1008;
 pub const RPMTAG_PROVIDENAME: rpmTagVal = 1047;
 pub const RPMTAG_PROVIDEVERSION: rpmTagVal = 1113;
+pub const RPMTAG_REQUIREFLAGS: rpmTagVal = 1048;
+pub const RPMTAG_REQUIRENAME: rpmTagVal = 1049;
+pub const RPMTAG_REQUIREVERSION: rpmTagVal = 1050;
+
+/// RPMSENSE version-comparison bits (rpmds.h). The exact `=` operator has
+/// EQUAL set and neither LESS nor GREATER; the mask isolates those three.
+pub const RPMSENSE_SENSE_MASK: u64 = 0x0e; // LESS(2)|GREATER(4)|EQUAL(8)
+pub const RPMSENSE_EQUAL: u64 = 0x08;
 pub const RPMTAG_BASENAMES: rpmTagVal = 1117;
 pub const RPMTAG_DIRINDEXES: rpmTagVal = 1116;
 pub const RPMTAG_DIRNAMES: rpmTagVal = 1118;

@@ -13,6 +13,7 @@
 //! cache directory.
 
 mod checksum;
+mod comps;
 mod decompress;
 mod filelists;
 mod http;
@@ -24,6 +25,9 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 pub use checksum::{Checksum, ChecksumKind};
+pub use comps::{
+    ArchivedCompsGroup, ArchivedCompsStore, ArchivedPkgReqType, CompsHandle, PkgReqType,
+};
 pub use http::{detect_aws_region, Http};
 pub use interned::PkgView;
 pub use primary::AvailablePackage;
@@ -96,6 +100,9 @@ pub struct RepoMetadata {
     /// The base URL the metadata was fetched from; package `location` hrefs are
     /// relative to this. Needed to build RPM download URLs.
     pub base_url: String,
+    /// Path to this repo's `comps.rkyv` (groups/environments), if it has one.
+    /// Loaded lazily via [`Self::load_comps`] only when a group op needs it.
+    comps_path: Option<PathBuf>,
 }
 
 impl RepoMetadata {
@@ -117,7 +124,13 @@ impl RepoMetadata {
             len,
             from_cache,
             base_url,
+            comps_path: None,
         })
+    }
+
+    /// Load this repo's groups/environments cache (mmap), if it has one.
+    pub fn load_comps(&self) -> Option<comps::CompsHandle> {
+        comps::CompsHandle::open(self.comps_path.as_ref()?)
     }
 
     /// The archived interned store backing this repo.
@@ -196,7 +209,8 @@ pub fn sync_repo(repo: &Repo, opts: &SyncOptions) -> Result<RepoMetadata, RepoEr
                         true,
                         base_url.trim().to_string(),
                     ) {
-                        Ok(md) => {
+                        Ok(mut md) => {
+                            md.comps_path = existing_comps(&dir);
                             tracing::debug!(repo = %repo.id, count = md.len(), "loaded parsed cache");
                             return Ok(md);
                         }
@@ -277,6 +291,10 @@ pub fn sync_repo(repo: &Repo, opts: &SyncOptions) -> Result<RepoMetadata, RepoEr
     write_cache(&dir, &repomd_path, &repomd_bytes, &primary_cache, &encoded)?;
     let _ = std::fs::write(&baseurl_path, &base);
 
+    // Build the groups/environments cache (comps.xml), if this repo has one.
+    // Best-effort: a missing/failed comps just means no group support here.
+    let comps_path = build_comps_cache(&http, &base, &md, &dir);
+
     // Prefer an mmap of the just-written cache over keeping the (large) rkyv
     // buffer resident: sync_all retains one RepoMetadata per repo, so several
     // big repos (RHEL BaseOS + AppStream) would otherwise pin hundreds of MB of
@@ -291,7 +309,41 @@ pub fn sync_repo(repo: &Repo, opts: &SyncOptions) -> Result<RepoMetadata, RepoEr
         }
         None => MetaBytes::Owned(encoded),
     };
-    RepoMetadata::from_bytes(repo.id.clone(), bytes, false, base)
+    let mut md_out = RepoMetadata::from_bytes(repo.id.clone(), bytes, false, base)?;
+    md_out.comps_path = comps_path;
+    Ok(md_out)
+}
+
+/// The comps cache path if it exists (warm path).
+fn existing_comps(dir: &Path) -> Option<PathBuf> {
+    let p = dir.join("comps.rkyv");
+    p.exists().then_some(p)
+}
+
+/// Fetch + parse a repo's `comps.xml` (groups) and bake it into `comps.rkyv`.
+/// Returns the cache path on success, `None` if the repo has no comps or on any
+/// error (group support is optional and must never fail a sync).
+fn build_comps_cache(http: &Http, base: &str, md: &RepoMd, dir: &Path) -> Option<PathBuf> {
+    // createrepo emits type "group" (plain) or "group_<compression>".
+    let entry = ["group_gz", "group_zst", "group_xz", "group"]
+        .iter()
+        .find_map(|t| md.get(t))?;
+    let url = join_url(base, &entry.location);
+    let compressed = http.get_bytes(&url).ok()?;
+    if !entry.checksum.verify(&compressed) {
+        return None;
+    }
+    let reader = decompress::reader(&entry.location, &compressed).ok()?;
+    let store = comps::parse_reader(reader).ok()?;
+    let encoded = rkyv::to_bytes::<rkyv::rancor::Error>(&store).ok()?;
+    let path = dir.join("comps.rkyv");
+    std::fs::write(&path, &encoded).ok()?;
+    tracing::debug!(
+        groups = store.groups.len(),
+        envs = store.environments.len(),
+        "cached comps"
+    );
+    Some(path)
 }
 
 /// Lazily load file ownership from a repo's `filelists.xml`, filtered to
