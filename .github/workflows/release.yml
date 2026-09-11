@@ -1,6 +1,6 @@
 name: Release
 
-# Build and publish a release binary when changes land on main.
+# Build and publish release binaries (x86_64 + aarch64) when changes land on main.
 on:
   push:
     branches:
@@ -10,12 +10,21 @@ permissions:
   contents: write
 
 jobs:
-  release:
-    name: build & release
-    runs-on: ubuntu-latest
-    # Build inside Rocky Linux 9 so the binary links a representative librpm
-    # (rpm 4.16, matching Amazon Linux 2023 / RHEL 9 era targets).
+  # Build one tarball per architecture, on a native runner of that arch, inside
+  # Rocky Linux 9 so the binary links a representative librpm (rpm 4.16, matching
+  # Amazon Linux 2023 / RHEL 9 era targets). Artifacts are handed to `release`.
+  build:
+    name: build (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
     container: rockylinux:9
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
     steps:
       - name: Install toolchain
         run: |
@@ -27,7 +36,6 @@ jobs:
         run: cargo build --release --workspace
 
       - name: Package
-        id: package
         run: |
           version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
           arch=$(uname -m)
@@ -36,15 +44,43 @@ jobs:
           cp README.md LICENSE "dist/${name}/" 2>/dev/null || true
           tar -C dist -czf "${name}.tar.gz" "${name}"
           sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rum-${{ matrix.arch }}
+          path: |
+            rum-*-linux.tar.gz
+            rum-*-linux.tar.gz.sha256
+          if-no-files-found: error
+
+  # Publish a single release carrying every architecture's assets. Splitting
+  # this from `build` avoids two arch jobs racing to create the same release.
+  release:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read version
+        id: meta
+        run: |
+          version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
           echo "version=${version}" >> "$GITHUB_OUTPUT"
-          echo "asset=${name}.tar.gz" >> "$GITHUB_OUTPUT"
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
 
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v${{ steps.package.outputs.version }}.${{ github.run_number }}
-          name: rum v${{ steps.package.outputs.version }} (build ${{ github.run_number }})
+          tag_name: v${{ steps.meta.outputs.version }}.${{ github.run_number }}
+          name: rum v${{ steps.meta.outputs.version }} (build ${{ github.run_number }})
           files: |
-            ${{ steps.package.outputs.asset }}
-            ${{ steps.package.outputs.asset }}.sha256
+            artifacts/rum-*-linux.tar.gz
+            artifacts/rum-*-linux.tar.gz.sha256
           generate_release_notes: true
