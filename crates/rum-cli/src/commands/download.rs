@@ -108,6 +108,23 @@ pub fn resolve_packages(packages: &[String], with_deps: bool) -> anyhow::Result<
     };
     let packages: &[String] = &requested;
 
+    // Multilib policy (dnf's `multilib_policy=best`): only consider packages
+    // for the host arch and `noarch`; secondary arches (e.g. i686 on x86_64)
+    // are excluded from the candidate pool unless a spec explicitly names that
+    // arch (`glibc.i686`). This keeps the resolved set single-arch so the rpm
+    // transaction doesn't hit cross-arch conflicts.
+    let allow_arches: HashSet<String> = {
+        let mut a = HashSet::new();
+        a.insert(std::env::consts::ARCH.to_string()); // host arch rum was built for
+        a.insert("noarch".to_string());
+        for spec in packages {
+            if let Some(arch) = explicit_arch(spec) {
+                a.insert(arch.to_string());
+            }
+        }
+        a
+    };
+
     // Resolve against the repos' zero-copy views (no owned Vec of the whole
     // package set), then materialize only the winning packages. `gid` is a
     // global package index; `offsets[ri]..offsets[ri+1]` is repo ri's range.
@@ -129,7 +146,7 @@ pub fn resolve_packages(packages: &[String], with_deps: bool) -> anyhow::Result<
         let winner_gids: Vec<usize> = if !with_deps {
             let mut gids = Vec::new();
             for spec in packages {
-                match best_match_views(spec, metas, &offsets) {
+                match best_match_views(spec, metas, &offsets, &allow_arches) {
                     Some(g) if !gids.contains(&g) => gids.push(g),
                     Some(_) => {}
                     None => anyhow::bail!("no package found matching `{spec}`"),
@@ -146,6 +163,7 @@ pub fn resolve_packages(packages: &[String], with_deps: bool) -> anyhow::Result<
                     metas,
                     offsets: &offsets,
                     extra: &extra,
+                    allow_arches: &allow_arches,
                 };
                 resolve_sat_with(packages, &src, &installed)
             };
@@ -166,6 +184,7 @@ pub fn resolve_packages(packages: &[String], with_deps: bool) -> anyhow::Result<
                         metas,
                         offsets: &offsets,
                         extra: &extra,
+                        allow_arches: &allow_arches,
                     };
                     resolve_sat_with(packages, &src, &installed)
                         .map_err(|e| anyhow::anyhow!("dependency resolution failed: {e}"))?
@@ -199,6 +218,9 @@ struct MetasSource<'a> {
     metas: &'a [RepoMetadata],
     offsets: &'a [usize],
     extra: &'a HashMap<String, Vec<String>>,
+    /// Package arches to consider (host arch + noarch, plus any explicitly
+    /// requested). Packages of other arches are skipped (multilib policy).
+    allow_arches: &'a HashSet<String>,
 }
 
 impl CandidateSource for MetasSource<'_> {
@@ -206,6 +228,11 @@ impl CandidateSource for MetasSource<'_> {
         for (ri, m) in self.metas.iter().enumerate() {
             let base = self.offsets[ri];
             for (pi, p) in m.views().enumerate() {
+                // Skip disallowed arches; `pi` still advances so global ids
+                // (base + pi) stay aligned with `rehydrate`.
+                if !self.allow_arches.contains(p.arch()) {
+                    continue;
+                }
                 let mut provides = p.provides_with_files_filtered(required);
                 if let Some(files) = self.extra.get(p.checksum_hex()) {
                     for f in files {
@@ -232,6 +259,9 @@ impl CandidateSource for MetasSource<'_> {
     fn scan_names(&self, visit: &mut dyn FnMut(NameView<'_>)) {
         for m in self.metas {
             for p in m.views() {
+                if !self.allow_arches.contains(p.arch()) {
+                    continue;
+                }
                 let provide_names = p.provide_names();
                 let require_names = p.require_names();
                 let recommend_names = p.recommend_names();
@@ -247,12 +277,30 @@ impl CandidateSource for MetasSource<'_> {
     }
 }
 
+/// The trailing `.arch` of a spec, if it names a known RPM architecture
+/// (so `glibc.i686` re-allows i686, but `python3.11` is not an arch).
+fn explicit_arch(spec: &str) -> Option<&str> {
+    const ARCHES: &[&str] = &[
+        "x86_64", "i686", "i386", "aarch64", "noarch", "armv7hl", "ppc64le", "s390x", "riscv64",
+    ];
+    let (_, arch) = spec.rsplit_once('.')?;
+    ARCHES.contains(&arch).then_some(arch)
+}
+
 /// Highest-EVR package matching `spec` (name or name.arch) across all repos,
-/// returned as a global index.
-fn best_match_views(spec: &str, metas: &[RepoMetadata], offsets: &[usize]) -> Option<usize> {
+/// restricted to allowed arches, returned as a global index.
+fn best_match_views(
+    spec: &str,
+    metas: &[RepoMetadata],
+    offsets: &[usize],
+    allow_arches: &HashSet<String>,
+) -> Option<usize> {
     let mut best: Option<(usize, Evr)> = None;
     for (ri, m) in metas.iter().enumerate() {
         for (pi, p) in m.views().enumerate() {
+            if !allow_arches.contains(p.arch()) {
+                continue;
+            }
             if p.name() == spec || p.name_arch() == spec {
                 let evr = p.evr_cmp();
                 let better = match &best {
