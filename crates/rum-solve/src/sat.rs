@@ -660,6 +660,19 @@ pub fn resolve_sat_with<S: CandidateSource + ?Sized>(
             }
         }
     });
+    // A requested spec need not be a package name: it may be a capability
+    // (e.g. a comps group lists `pkgconfig`, provided by `pkgconf-pkg-config`).
+    // If no package name matched but something provides it, use the capability
+    // as the root requirement so resolvo picks a provider (like `dnf install
+    // <capability>`).
+    for (i, spec) in requested.iter().enumerate() {
+        if !found[i] && providable.contains(spec.as_str()) {
+            found[i] = true;
+            if !requested_names.iter().any(|n| n == spec) {
+                requested_names.push(spec.clone());
+            }
+        }
+    }
     for (i, spec) in requested.iter().enumerate() {
         if !found[i] {
             return Err(ResolveError::NotFound(spec.clone()));
