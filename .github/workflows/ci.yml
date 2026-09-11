@@ -15,8 +15,16 @@ env:
 
 jobs:
   test:
-    name: build & test
-    runs-on: ubuntu-latest
+    name: build & test (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
 
@@ -32,7 +40,9 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # Formatting is arch-independent; check it once on x86_64.
       - name: Format
+        if: matrix.arch == 'x86_64'
         run: cargo fmt --all --check
 
       - name: Clippy
@@ -44,11 +54,20 @@ jobs:
   # Real-RPM-system integration test: rum coexists with dnf/yum on a shared
   # rpmdb (a dnf-installed package is seen by rum and not reinstalled; rum's
   # own install/remove are real rpm transactions). Runs in a RockyLinux
-  # container because it needs a working rpmdb, dnf, and the distro repos.
+  # container (multi-arch image) on both architectures because it needs a
+  # working rpmdb, dnf, and the distro repos.
   integration:
-    name: coexistence (RockyLinux 9)
-    runs-on: ubuntu-latest
+    name: coexistence (RockyLinux 9, ${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
     container: rockylinux:9
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
     steps:
       - name: Install toolchain
         run: dnf install -y gcc rpm-devel cargo rust git tar
