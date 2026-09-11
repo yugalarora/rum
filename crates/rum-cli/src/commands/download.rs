@@ -611,8 +611,38 @@ fn join_url(base: &str, href: &str) -> String {
     format!(
         "{}/{}",
         base.trim_end_matches('/'),
-        href.trim_start_matches('/')
+        encode_path(href.trim_start_matches('/'))
     )
+}
+
+/// Percent-encode a URL path (RFC 3986): every byte outside the unreserved set
+/// (ALPHA / DIGIT / `-._~`) is `%`-escaped, except the `/` separator, `%` (so
+/// an already-encoded href is not double-encoded), and `?`/`#`/`&`/`=` so any
+/// query string is preserved. Repo `location` hrefs are raw filenames, so a
+/// literal `+` (e.g. `gcc-c++-...rpm`) must become `%2B` — S3 treats an
+/// unencoded `+` as a different key and returns 403 AccessDenied, which is why
+/// `+`-named packages failed to download while every other package worked.
+fn encode_path(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for &b in s.as_bytes() {
+        match b {
+            b'A'..=b'Z'
+            | b'a'..=b'z'
+            | b'0'..=b'9'
+            | b'-'
+            | b'_'
+            | b'.'
+            | b'~'
+            | b'/'
+            | b'%'
+            | b'?'
+            | b'#'
+            | b'&'
+            | b'=' => out.push(b as char),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
 }
 
 fn basename(location: &str) -> &str {
@@ -631,5 +661,39 @@ fn human(bytes: u64) -> String {
         format!("{bytes} B")
     } else {
         format!("{v:.1} {}", UNITS[u])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encode_path_escapes_plus_keeps_structure() {
+        // '+' must become %2B (the gcc-c++ / libstdc++ download bug); path
+        // separators, '..', and unreserved chars are preserved.
+        assert_eq!(
+            encode_path("../../../../blobstore/abc/gcc-c++-11.5.0-5.amzn2023.x86_64.rpm"),
+            "../../../../blobstore/abc/gcc-c%2B%2B-11.5.0-5.amzn2023.x86_64.rpm"
+        );
+        // Spaces encode; already-encoded input is not double-encoded.
+        assert_eq!(encode_path("a b"), "a%20b");
+        assert_eq!(encode_path("a%2Bb"), "a%2Bb");
+        // A query string is preserved verbatim.
+        assert_eq!(
+            encode_path("blobstore/x/f.rpm?k=v"),
+            "blobstore/x/f.rpm?k=v"
+        );
+    }
+
+    #[test]
+    fn join_url_encodes_href() {
+        assert_eq!(
+            join_url(
+                "https://h/core/x86_64/",
+                "../../blobstore/z/libstdc++-1.rpm"
+            ),
+            "https://h/core/x86_64/../../blobstore/z/libstdc%2B%2B-1.rpm"
+        );
     }
 }
