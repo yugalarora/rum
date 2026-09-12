@@ -24,8 +24,6 @@ use repo::{parse_bool, parse_duration_secs};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
-    #[error("no dnf.conf or yum.conf found (looked at {0:?})")]
-    NoMainConfig(Vec<PathBuf>),
     #[error("i/o error reading {path}: {source}")]
     Io {
         path: PathBuf,
@@ -120,7 +118,12 @@ fn load_main(candidates: &[PathBuf]) -> Result<(MainConfig, Ini), ConfigError> {
             }
         }
     }
-    Err(ConfigError::NoMainConfig(candidates.to_vec()))
+    // No dnf.conf / yum.conf present. dnf treats the main config as optional
+    // (its settings just fall back to defaults) and still reads the repo files
+    // under /etc/yum.repos.d/. Minimal images (e.g. Oracle Linux *-slim, which
+    // ship repo files but no dnf.conf) rely on this, so fall back to defaults
+    // rather than failing.
+    Ok((MainConfig::default(), Ini::parse("")))
 }
 
 fn build_main(ini: &Ini) -> MainConfig {
@@ -282,6 +285,37 @@ mod tests {
             }
             other => panic!("unexpected source: {other:?}"),
         }
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn missing_main_config_falls_back_to_defaults_and_repos() {
+        // Minimal images (e.g. Oracle Linux *-slim) ship repo files but no
+        // dnf.conf/yum.conf; rum must still load, using default [main] settings.
+        let tmp = std::env::temp_dir().join(format!("rum-cfg-nomain-{}", std::process::id()));
+        let repos = tmp.join("repos.d");
+        std::fs::create_dir_all(&repos).unwrap();
+        write(
+            &repos,
+            "ol.repo",
+            "[ol9_baseos]\nname=OL $releasever BaseOS\nbaseurl=https://yum/$releasever/$basearch/\nenabled=1\n",
+        );
+
+        let paths = Paths {
+            // Point only at a non-existent main config.
+            main_config_candidates: vec![tmp.join("does-not-exist.conf")],
+            repos_dir: repos,
+        };
+        let cfg = Config::load_with(&paths, test_vars()).unwrap();
+
+        // Defaults applied, and the repo file was still read.
+        assert_eq!(
+            cfg.main.installonly_limit,
+            MainConfig::default().installonly_limit
+        );
+        assert_eq!(cfg.enabled_repos().len(), 1);
+        assert_eq!(cfg.enabled_repos()[0].id, "ol9_baseos");
 
         std::fs::remove_dir_all(&tmp).ok();
     }

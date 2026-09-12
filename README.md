@@ -78,21 +78,29 @@ CentOS Stream** — across the sqlite and BerkeleyDB rpmdb backends.
 
 ### From a release binary
 
-Binaries are published for **x86_64** and **aarch64**. Pick your architecture
-(`uname -m`), download from the [Releases](https://github.com/yugalarora/rum/releases)
-page, verify, and install:
+Binaries are published for **x86_64** and **aarch64**, one per RPM era (rum
+links the system `librpm`, whose soname differs by release). Pick the build
+matching your distribution:
+
+| Build | librpm | Distributions |
+|---|---|---|
+| `el8` | `librpm.so.8` (rpm 4.14) | RHEL 8, Oracle Linux 8, Rocky 8, AlmaLinux 8 |
+| `el9` | `librpm.so.9` (rpm 4.16) | RHEL 9, Oracle Linux 9, Rocky 9, AlmaLinux 9, **Amazon Linux 2023** |
+| `el10` | `librpm.so.10` (rpm 4.19) | RHEL 10, Oracle Linux 10, AlmaLinux 10 |
 
 ```bash
-arch=$(uname -m)                     # x86_64 or aarch64
+arch=$(uname -m)                                 # x86_64 or aarch64
+el=$(rpm -E %rhel 2>/dev/null); case "$el" in 8|9|10) ;; *) el=9 ;; esac  # AL2023 -> 9
 base=https://github.com/yugalarora/rum/releases/latest/download
-curl -fsSL -O "$base/rum-<ver>-${arch}-linux.tar.gz"
-curl -fsSL -O "$base/rum-<ver>-${arch}-linux.tar.gz.sha256"
-sha256sum -c "rum-<ver>-${arch}-linux.tar.gz.sha256"
-tar -xzf "rum-<ver>-${arch}-linux.tar.gz"
+curl -fsSL -O "$base/rum-<ver>-${arch}-el${el}.tar.gz"
+curl -fsSL -O "$base/rum-<ver>-${arch}-el${el}.tar.gz.sha256"
+sha256sum -c "rum-<ver>-${arch}-el${el}.tar.gz.sha256"
+tar -xzf "rum-<ver>-${arch}-el${el}.tar.gz"
 sudo install -m755 rum-*/rum /usr/local/bin/rum
 ```
 
-`rum` links the system `librpm`, which is already present on every RPM-based distro.
+(Amazon Linux 2023 is EL9-era — use the `el9` build.) `librpm` itself is already
+present on every RPM-based distro.
 
 ### Build from source
 
