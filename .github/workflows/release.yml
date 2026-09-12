@@ -1,6 +1,11 @@
 name: Release
 
-# Build and publish release binaries (x86_64 + aarch64) when changes land on main.
+# Build and publish release binaries for every RPM era and CPU architecture
+# when changes land on main. rum links a specific librpm soname, so one binary
+# is NOT portable across RPM majors — we build one per era:
+#   el8  -> rpm 4.14, librpm.so.8   (RHEL/Oracle/Rocky/Alma 8)
+#   el9  -> rpm 4.16, librpm.so.9   (RHEL/Oracle/Rocky/Alma 9, Amazon Linux 2023)
+#   el10 -> rpm 4.19, librpm.so.10  (RHEL/Oracle/Alma 10)
 on:
   push:
     branches:
@@ -10,36 +15,44 @@ permissions:
   contents: write
 
 jobs:
-  # Build one tarball per architecture, on a native runner of that arch, inside
-  # Rocky Linux 9 so the binary links a representative librpm (rpm 4.16, matching
-  # Amazon Linux 2023 / RHEL 9 era targets). Artifacts are handed to `release`.
+  # Build one tarball per (era x arch), on a native runner of that arch, inside
+  # a representative image of that era so the binary links the matching librpm.
   build:
-    name: build (${{ matrix.arch }})
-    runs-on: ${{ matrix.runner }}
-    container: rockylinux:9
+    name: build (el${{ matrix.el }}, ${{ matrix.platform.arch }})
+    runs-on: ${{ matrix.platform.runner }}
+    container: ${{ matrix.image }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - arch: x86_64
-            runner: ubuntu-latest
-          - arch: aarch64
-            runner: ubuntu-24.04-arm
+          - { el: 8, image: "oraclelinux:8" }
+          - { el: 9, image: "almalinux:9" }
+          - { el: 10, image: "almalinux:10" }
+        platform:
+          - { arch: x86_64, runner: ubuntu-latest }
+          - { arch: aarch64, runner: ubuntu-24.04-arm }
     steps:
       - name: Install toolchain
         run: |
-          dnf install -y gcc rpm-devel popt-devel openssl-devel pkgconfig cargo rust git tar gzip
+          set -eux
+          dnf install -y --allowerasing gcc rpm-devel popt-devel openssl-devel pkgconfig git tar gzip which findutils
+          # rustup for a uniform, MSRV-satisfying toolchain (distro rust on el8 lags).
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       - uses: actions/checkout@v4
 
       - name: Build release
-        run: cargo build --release --workspace
+        run: |
+          . "$HOME/.cargo/env"
+          cargo build --release --workspace
 
       - name: Package
         run: |
+          . "$HOME/.cargo/env"
           version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
           arch=$(uname -m)
-          name="rum-${version}-${arch}-linux"
+          name="rum-${version}-${arch}-el${{ matrix.el }}"
           install -Dm755 target/release/rum "dist/${name}/rum"
           cp README.md LICENSE "dist/${name}/" 2>/dev/null || true
           tar -C dist -czf "${name}.tar.gz" "${name}"
@@ -48,14 +61,14 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: rum-${{ matrix.arch }}
+          name: rum-el${{ matrix.el }}-${{ matrix.platform.arch }}
           path: |
-            rum-*-linux.tar.gz
-            rum-*-linux.tar.gz.sha256
+            rum-*.tar.gz
+            rum-*.tar.gz.sha256
           if-no-files-found: error
 
-  # Publish a single release carrying every architecture's assets. Splitting
-  # this from `build` avoids two arch jobs racing to create the same release.
+  # Publish a single release carrying every era's and architecture's assets.
+  # Split from build so the parallel build jobs don't race to create the release.
   release:
     name: publish release
     needs: build
@@ -81,6 +94,6 @@ jobs:
           tag_name: v${{ steps.meta.outputs.version }}.${{ github.run_number }}
           name: rum v${{ steps.meta.outputs.version }} (build ${{ github.run_number }})
           files: |
-            artifacts/rum-*-linux.tar.gz
-            artifacts/rum-*-linux.tar.gz.sha256
+            artifacts/rum-*.tar.gz
+            artifacts/rum-*.tar.gz.sha256
           generate_release_notes: true
