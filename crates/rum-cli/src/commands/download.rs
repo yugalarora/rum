@@ -63,6 +63,10 @@ impl Resolution {
     pub fn total_bytes(&self) -> u64 {
         self.ids.iter().map(|&i| self.packages[i].size).sum()
     }
+    /// The resolved (winning) packages.
+    pub fn winner_packages(&self) -> impl Iterator<Item = &AvailablePackage> {
+        self.ids.iter().map(move |&i| &self.packages[i])
+    }
 }
 
 /// The result of downloading a resolved package set.

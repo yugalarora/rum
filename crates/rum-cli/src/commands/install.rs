@@ -32,6 +32,19 @@ pub fn run(packages: &[String], assume_yes: bool) -> anyhow::Result<()> {
     for n in &nevras {
         println!("  {n}");
     }
+
+    // installonly_limit: installing a new kernel (or other install-only package)
+    // keeps old versions side-by-side; prune the oldest beyond the limit, never
+    // the running kernel or the one just installed. rpm won't do this — it's
+    // dnf's (now rum's) job, added to the same transaction.
+    let prunes = installonly_prunes_for(&resolution);
+    if !prunes.is_empty() {
+        println!("\nRemoving {} old install-only package(s):", prunes.len());
+        for (n, v, r) in &prunes {
+            println!("  {n}-{v}-{r}");
+        }
+    }
+
     println!("\nTotal download size: {}", human(resolution.total_bytes()));
 
     if !assume_yes && !confirm() {
@@ -46,24 +59,118 @@ pub fn run(packages: &[String], assume_yes: bool) -> anyhow::Result<()> {
     // Download into rum's package cache, then commit.
     let pkgdir = sys::effective_cachedir("/var/cache/rum").join("packages");
     let fetched = download::fetch(&resolution, &pkgdir)?;
-    commit_install(&fetched.files)
+    commit_install(&fetched.files, &prunes)
 }
 
-fn commit_install(files: &[PathBuf]) -> anyhow::Result<()> {
+/// Detect install-only packages (kernels): a package that provides an
+/// `installonlypkg(...)` capability, or the `kernel`/`kernel-core` names.
+fn is_install_only(p: &rum_repo::AvailablePackage) -> bool {
+    p.name == "kernel"
+        || p.name == "kernel-core"
+        || p.provides
+            .iter()
+            .any(|d| d.name.starts_with("installonlypkg("))
+}
+
+/// Compute the (name, version, release) builds to erase to honour
+/// installonly_limit for this transaction's install-only winners.
+fn installonly_prunes_for(resolution: &download::Resolution) -> Vec<(String, String, String)> {
+    let Ok(db) = rum_rpm::Rpmdb::open() else {
+        return Vec::new();
+    };
+    let limit = crate::sys::load_config()
+        .map(|c| c.main.installonly_limit as usize)
+        .unwrap_or(3)
+        .max(1);
+    let running = crate::sys::running_kernel_release();
+    let mut names: Vec<&str> = resolution
+        .winner_packages()
+        .filter(|p| is_install_only(p))
+        .map(|p| p.name.as_str())
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+
+    let mut out = Vec::new();
+    for name in names {
+        let new_builds: Vec<(String, String)> = resolution
+            .winner_packages()
+            .filter(|p| p.name == name)
+            .map(|p| (p.version.clone(), p.release.clone()))
+            .collect();
+        let installed: Vec<(String, String)> = db
+            .by_name(name)
+            .iter()
+            .map(|p| (p.version.clone(), p.release.clone()))
+            .collect();
+        for (v, r) in installonly_prunes(&installed, running.as_deref(), &new_builds, limit) {
+            out.push((name.to_string(), v, r));
+        }
+    }
+    out
+}
+
+/// Pure prune selection: of the builds present after installing `new_builds`
+/// (installed ∪ new), keep at most `limit`, erasing the OLDEST first but never
+/// the running kernel or a just-installed build.
+fn installonly_prunes(
+    installed: &[(String, String)],
+    running: Option<&str>,
+    new_builds: &[(String, String)],
+    limit: usize,
+) -> Vec<(String, String)> {
+    use rum_solve::Evr;
+    let mut all: Vec<(String, String)> = installed.to_vec();
+    for nb in new_builds {
+        if !all.contains(nb) {
+            all.push(nb.clone());
+        }
+    }
+    if all.len() <= limit {
+        return Vec::new();
+    }
+    all.sort_by(|a, b| Evr::new(None, &a.0, &a.1).compare(&Evr::new(None, &b.0, &b.1)));
+    let is_running = |b: &(String, String)| {
+        running.is_some_and(|rk| rk.starts_with(&format!("{}-{}", b.0, b.1)))
+    };
+    let mut excess = all.len() - limit;
+    let mut prune = Vec::new();
+    for b in &all {
+        if excess == 0 {
+            break;
+        }
+        if is_running(b) || new_builds.contains(b) {
+            continue; // never prune the running kernel or the just-installed build
+        }
+        prune.push(b.clone());
+        excess -= 1;
+    }
+    prune
+}
+
+fn commit_install(files: &[PathBuf], prunes: &[(String, String, String)]) -> anyhow::Result<()> {
     let use_binary = std::env::var_os("RUM_USE_RPM_BINARY").is_some();
     if sys::is_root() && !use_binary {
-        commit_install_native(files)
+        commit_install_native(files, prunes)
     } else {
-        commit_install_rpm_binary(files)
+        commit_install_rpm_binary(files, prunes)
     }
 }
 
 /// Commit natively through librpm (`rpmtsRun`), no subprocess. Requires root.
-fn commit_install_native(files: &[PathBuf]) -> anyhow::Result<()> {
+/// Old install-only builds are erased in the SAME transaction as the installs.
+fn commit_install_native(
+    files: &[PathBuf],
+    prunes: &[(String, String, String)],
+) -> anyhow::Result<()> {
     let mut tx =
         Transaction::new().map_err(|e| anyhow::anyhow!("cannot start transaction: {e}"))?;
     for f in files {
         tx.add_install(f).map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
+    for (n, v, r) in prunes {
+        tx.add_erase_exact(n, v, r)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
     }
     tx.run(false).map_err(|e| anyhow::anyhow!("{e}"))?;
     println!("Complete!");
@@ -72,8 +179,12 @@ fn commit_install_native(files: &[PathBuf]) -> anyhow::Result<()> {
 
 /// Fallback path: `sudo rpm -Uvh` (used when rum is not root, or when
 /// `RUM_USE_RPM_BINARY` is set). `-U` installs new and upgrades existing, in one
-/// ordered transaction with scriptlets; `-h` shows a progress hash.
-fn commit_install_rpm_binary(files: &[PathBuf]) -> anyhow::Result<()> {
+/// ordered transaction with scriptlets; `-h` shows a progress hash. Any
+/// install-only prunes are then erased with `rpm -e`.
+fn commit_install_rpm_binary(
+    files: &[PathBuf],
+    prunes: &[(String, String, String)],
+) -> anyhow::Result<()> {
     let mut cmd = sys::privileged("rpm");
     cmd.arg("-Uvh");
     for f in files {
@@ -82,13 +193,27 @@ fn commit_install_rpm_binary(files: &[PathBuf]) -> anyhow::Result<()> {
     let status = cmd
         .status()
         .map_err(|e| anyhow::anyhow!("failed to launch rpm: {e}"))?;
-
-    if status.success() {
-        println!("Complete!");
-        Ok(())
-    } else {
-        anyhow::bail!("rpm transaction failed (exit {:?})", status.code())
+    if !status.success() {
+        anyhow::bail!("rpm transaction failed (exit {:?})", status.code());
     }
+    if !prunes.is_empty() {
+        let mut ecmd = sys::privileged("rpm");
+        ecmd.arg("-e");
+        for (n, v, r) in prunes {
+            ecmd.arg(format!("{n}-{v}-{r}"));
+        }
+        let est = ecmd
+            .status()
+            .map_err(|e| anyhow::anyhow!("failed to launch rpm -e: {e}"))?;
+        if !est.success() {
+            anyhow::bail!(
+                "pruning old install-only packages failed (exit {:?})",
+                est.code()
+            );
+        }
+    }
+    println!("Complete!");
+    Ok(())
 }
 
 fn human(bytes: u64) -> String {
@@ -103,5 +228,44 @@ fn human(bytes: u64) -> String {
         format!("{bytes} B")
     } else {
         format!("{v:.1} {}", UNITS[u])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prunes_oldest_keeping_running_and_new() {
+        let installed = vec![
+            ("6.0.0".into(), "1.el10".into()),
+            ("6.1.0".into(), "1.el10".into()),
+            ("6.2.0".into(), "1.el10".into()),
+        ];
+        let new = vec![("6.3.0".into(), "1.el10".into())];
+        // 3 installed + 1 new = 4 > limit 3 -> prune the single oldest (6.0.0),
+        // keeping 6.1.0, the running 6.2.0, and the just-installed 6.3.0.
+        let p = installonly_prunes(&installed, Some("6.2.0-1.el10.x86_64"), &new, 3);
+        assert_eq!(p, vec![("6.0.0".to_string(), "1.el10".to_string())]);
+    }
+
+    #[test]
+    fn no_prune_at_or_under_limit() {
+        let installed = vec![("6.0.0".into(), "1".into())];
+        let new = vec![("6.1.0".into(), "1".into())];
+        assert!(installonly_prunes(&installed, None, &new, 3).is_empty());
+    }
+
+    #[test]
+    fn never_prunes_running_even_if_oldest() {
+        let installed = vec![
+            ("6.0.0".into(), "1".into()),
+            ("6.1.0".into(), "1".into()),
+            ("6.2.0".into(), "1".into()),
+        ];
+        let new = vec![("6.3.0".into(), "1".into())];
+        // Oldest (6.0.0) is the running kernel -> keep it, prune next-oldest.
+        let p = installonly_prunes(&installed, Some("6.0.0-1.x86_64"), &new, 3);
+        assert_eq!(p, vec![("6.1.0".to_string(), "1".to_string())]);
     }
 }

@@ -711,6 +711,52 @@ mod imp {
             }
         }
 
+        /// Queue erasure of only the installed build of `name` at exactly
+        /// `version`-`release` (leaving other versions of the same name). Used
+        /// to prune old install-only kernels without touching the rest.
+        pub fn add_erase_exact(
+            &mut self,
+            name: &str,
+            version: &str,
+            release: &str,
+        ) -> Result<(), RpmError> {
+            let key = CString::new(name).map_err(|_| RpmError::NotInstalled(name.into()))?;
+            let mut any = false;
+            // SAFETY: valid ts; iterate installed headers of this name and erase
+            // only the one whose version+release match.
+            unsafe {
+                let mi = ffi::rpmtsInitIterator(
+                    self.ts,
+                    ffi::RPMTAG_NAME,
+                    key.as_ptr() as *const c_void,
+                    0,
+                );
+                if !mi.is_null() {
+                    loop {
+                        let h = ffi::rpmdbNextIterator(mi);
+                        if h.is_null() {
+                            break;
+                        }
+                        if get_string(h, ffi::RPMTAG_VERSION) == version
+                            && get_string(h, ffi::RPMTAG_RELEASE) == release
+                            && ffi::rpmtsAddEraseElement(self.ts, h, -1) == 0
+                        {
+                            any = true;
+                            self.count += 1;
+                        }
+                    }
+                    ffi::rpmdbFreeIterator(mi);
+                }
+            }
+            if any {
+                Ok(())
+            } else {
+                Err(RpmError::NotInstalled(format!(
+                    "{name}-{version}-{release}"
+                )))
+            }
+        }
+
         pub fn is_empty(&self) -> bool {
             self.count == 0
         }
@@ -843,6 +889,9 @@ impl Transaction {
         Err(RpmError::Unsupported)
     }
     pub fn add_erase(&mut self, _name: &str) -> Result<(), RpmError> {
+        Err(RpmError::Unsupported)
+    }
+    pub fn add_erase_exact(&mut self, _n: &str, _v: &str, _r: &str) -> Result<(), RpmError> {
         Err(RpmError::Unsupported)
     }
     pub fn is_empty(&self) -> bool {
