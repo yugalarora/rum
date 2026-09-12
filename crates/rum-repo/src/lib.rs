@@ -172,6 +172,9 @@ pub struct SyncOptions {
     pub cachedir: PathBuf,
     /// Ignore cache freshness and re-download.
     pub force_refresh: bool,
+    /// yum variables, used to expand `$basearch`/`$releasever` etc. in URLs a
+    /// mirrorlist/metalink returns (not just in the repo file).
+    pub vars: rum_config::Vars,
 }
 
 impl SyncOptions {
@@ -179,6 +182,7 @@ impl SyncOptions {
         SyncOptions {
             cachedir: cachedir.into(),
             force_refresh: false,
+            vars: rum_config::Vars::empty(),
         }
     }
 }
@@ -225,7 +229,7 @@ pub fn sync_repo(repo: &Repo, opts: &SyncOptions) -> Result<RepoMetadata, RepoEr
     // Refresh: build an HTTP client honouring this repo's TLS settings, then
     // resolve mirrors and fetch repomd.xml from the first that works.
     let http = Http::for_repo(repo)?;
-    let bases = http.resolve_baseurls(&repo.source)?;
+    let bases = http.resolve_baseurls(&repo.source, &opts.vars)?;
     let (base, repomd_bytes) = fetch_repomd(&http, &repo.id, &bases)?;
     let repomd_str = String::from_utf8_lossy(&repomd_bytes);
     let md = RepoMd::parse(&repomd_str)?;
