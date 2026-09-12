@@ -47,6 +47,7 @@ pub struct IPackage {
     pub provides: Vec<IDep>,
     pub requires: Vec<IDep>,
     pub recommends: Vec<IDep>,
+    pub obsoletes: Vec<IDep>,
     pub files: Vec<Sym>,
 }
 
@@ -228,6 +229,14 @@ impl<'a> PkgView<'a> {
             .map(|d| self.store.dep(d))
             .collect()
     }
+    /// Owned `Dep`s for Obsoletes.
+    pub fn obsoletes(&self) -> Vec<Dep> {
+        self.pkg
+            .obsoletes
+            .iter()
+            .map(|d| self.store.dep(d))
+            .collect()
+    }
     /// Provides plus advertised files (as unversioned provides), keeping only
     /// capabilities whose name is in `keep`. Resolving the name (cheap `&str`)
     /// before building the `Dep` avoids allocating for the many never-required
@@ -284,6 +293,7 @@ impl ArchivedStore {
             provides: p.provides.iter().map(|d| self.dep(d)).collect(),
             requires: p.requires.iter().map(|d| self.dep(d)).collect(),
             recommends: p.recommends.iter().map(|d| self.dep(d)).collect(),
+            obsoletes: p.obsoletes.iter().map(|d| self.dep(d)).collect(),
             files: p
                 .files
                 .iter()

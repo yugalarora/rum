@@ -36,6 +36,9 @@ pub struct AvailablePackage {
     pub provides: Vec<Dep>,
     /// Capabilities this package requires (from `<format><rpm:requires>`).
     pub requires: Vec<Dep>,
+    /// Capabilities this package obsoletes (from `<format><rpm:obsoletes>`);
+    /// installing it removes/replaces any installed package matching these.
+    pub obsoletes: Vec<Dep>,
     /// Weak dependencies (from `<format><rpm:recommends>`); installed by
     /// default when satisfiable, matching dnf's `install_weak_deps=1`.
     pub recommends: Vec<Dep>,
@@ -111,8 +114,10 @@ pub fn parse_reader<R: std::io::Read>(input: R, repo_id: &str) -> Result<Store, 
                                 b"provides" => dep_ctx = DepCtx::Provides,
                                 b"requires" => dep_ctx = DepCtx::Requires,
                                 b"recommends" => dep_ctx = DepCtx::Recommends,
-                                b"conflicts" | b"obsoletes" | b"suggests" | b"enhances"
-                                | b"supplements" => dep_ctx = DepCtx::None,
+                                b"obsoletes" => dep_ctx = DepCtx::Obsoletes,
+                                b"conflicts" | b"suggests" | b"enhances" | b"supplements" => {
+                                    dep_ctx = DepCtx::None
+                                }
                                 b"file" => field = Field::File,
                                 b"entry" => push_entry(b, dep_ctx, &e),
                                 _ => field = Field::None,
@@ -202,6 +207,7 @@ enum DepCtx {
     Provides,
     Requires,
     Recommends,
+    Obsoletes,
 }
 
 /// Push an `<rpm:entry>` into the provides/requires list per the active context.
@@ -214,6 +220,7 @@ fn push_entry(b: &mut Builder, ctx: DepCtx, e: &quick_xml::events::BytesStart) {
             DepCtx::Provides => b.provides.push(d),
             DepCtx::Requires => b.requires.push(d),
             DepCtx::Recommends => b.recommends.push(d),
+            DepCtx::Obsoletes => b.obsoletes.push(d),
             DepCtx::None => {}
         }
     }
@@ -248,6 +255,7 @@ struct Builder {
     provides: Vec<Dep>,
     requires: Vec<Dep>,
     recommends: Vec<Dep>,
+    obsoletes: Vec<Dep>,
     files: Vec<String>,
 }
 
@@ -301,6 +309,7 @@ impl Builder {
             provides: self.provides.iter().map(|d| idep(itn, d)).collect(),
             requires: self.requires.iter().map(|d| idep(itn, d)).collect(),
             recommends: self.recommends.iter().map(|d| idep(itn, d)).collect(),
+            obsoletes: self.obsoletes.iter().map(|d| idep(itn, d)).collect(),
             files: self.files.iter().map(|f| itn.intern(f)).collect(),
         })
     }
@@ -346,6 +355,9 @@ mod tests {
               <rpm:recommends>
                 <rpm:entry name="bash-completion"/>
               </rpm:recommends>
+              <rpm:obsoletes>
+                <rpm:entry name="bash-legacy" flags="LT" epoch="0" ver="4.0"/>
+              </rpm:obsoletes>
               <file>/usr/bin/bash</file>
               <file type="dir">/etc/bash</file>
               <checksum>should-not-be-picked</checksum>
@@ -390,6 +402,9 @@ mod tests {
         assert!(bash.requires[1].evr.is_none()); // /bin/sh unversioned
         assert_eq!(bash.recommends.len(), 1);
         assert_eq!(bash.recommends[0].name, "bash-completion");
+        assert_eq!(bash.obsoletes.len(), 1);
+        assert_eq!(bash.obsoletes[0].name, "bash-legacy");
+        assert_eq!(bash.obsoletes[0].flag, rum_solve::DepFlag::Lt);
         assert_eq!(bash.files, vec!["/usr/bin/bash", "/etc/bash"]);
 
         let zlib = &pkgs[1];
