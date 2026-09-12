@@ -418,6 +418,27 @@ pub fn resolve_packages(packages: &[String], with_deps: bool) -> anyhow::Result<
                         }
                     }
                 }
+
+                // Scoped-present (step 1): the minimal set of INSTALLED packages
+                // the resolver must reason about for this transaction's
+                // conflicts/obsoletes — the targeted packages plus their
+                // dependents (transitive). Only scanned when a winner actually
+                // has a conflict/obsolete, so routine installs pay nothing.
+                // Computed and measured here; feeding it to the solver is step 2.
+                let target_caps: HashSet<String> = winners
+                    .iter()
+                    .flat_map(|w| w.conflicts.iter().chain(w.obsoletes.iter()))
+                    .map(|d| d.name.clone())
+                    .collect();
+                if !target_caps.is_empty() {
+                    let inst = db.installed_packages_deps();
+                    let scoped = super::scope::scope_installed(&target_caps, &inst);
+                    tracing::debug!(
+                        scoped = scoped.len(),
+                        installed = inst.len(),
+                        "scoped-present installed set"
+                    );
+                }
             }
         }
 

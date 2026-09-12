@@ -12,6 +12,7 @@ pub mod pkgindex;
 pub mod remove;
 pub mod repo_sync;
 pub mod repolist;
+pub mod scope;
 pub mod search;
 
 use crate::Command;

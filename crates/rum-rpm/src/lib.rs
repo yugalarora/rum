@@ -71,6 +71,20 @@ pub struct Rpmdb {
     ts: ffi::rpmts,
 }
 
+/// One installed package with the capability names it provides and requires —
+/// enough to scope conflicts/obsoletes targets and their dependents for the
+/// resolver (see rum-cli's scoping pass). Versions are the EVR string;
+/// capability matching is by name (a safe superset for scoping).
+pub struct InstalledPkg {
+    pub name: String,
+    /// `[epoch:]version-release`.
+    pub evr: String,
+    /// Provided capability names (self-name included), excluding files.
+    pub provides: Vec<String>,
+    /// Required capability names (excluding rpmlib(...) and rich `(...)`).
+    pub requires: Vec<String>,
+}
+
 /// Installed packages' reverse dependencies that a transaction can break:
 /// exact `= version` couplings and rich `(A if B)` conditionals.
 #[derive(Default)]
@@ -304,6 +318,37 @@ mod imp {
             rd
         }
 
+        /// Every installed package with its provided/required capability names
+        /// (one rpmdb scan). Feeds rum-cli's scoped-present resolver pass.
+        pub fn installed_packages_deps(&self) -> Vec<super::InstalledPkg> {
+            let mut out = Vec::new();
+            // SAFETY: valid ts; iterate every installed header, reading name/EVR
+            // plus provide and require capability names.
+            unsafe {
+                let mi = ffi::rpmtsInitIterator(self.ts, ffi::RPMDBI_PACKAGES, ptr::null(), 0);
+                if mi.is_null() {
+                    return out;
+                }
+                loop {
+                    let h = ffi::rpmdbNextIterator(mi);
+                    if h.is_null() {
+                        break;
+                    }
+                    let pkg = header_to_package(h);
+                    let mut caps: Vec<(String, Option<String>)> = Vec::new();
+                    collect_capabilities(h, &mut caps);
+                    out.push(super::InstalledPkg {
+                        name: pkg.name.clone(),
+                        evr: pkg.evr(),
+                        provides: caps.into_iter().map(|(n, _)| n).collect(),
+                        requires: collect_require_names(h),
+                    });
+                }
+                ffi::rpmdbFreeIterator(mi);
+            }
+            out
+        }
+
         fn iter_with(&self, tag: ffi::rpmTagVal, key: Option<&str>) -> Vec<Package> {
             let ckey = key.map(|k| CString::new(k).unwrap());
             let (keyp, keylen) = match &ckey {
@@ -382,6 +427,33 @@ mod imp {
 
     /// Record header `h`'s reverse deps: exact-`=` requires as `cap ->
     /// (pkg, version)`, and rich `(...)` requires as `(pkg, expr)`.
+    /// Require capability names of header `h`, skipping `rpmlib(...)` and rich
+    /// `(...)` boolean requires (which aren't plain capability names).
+    unsafe fn collect_require_names(h: ffi::Header) -> Vec<String> {
+        let mut out = Vec::new();
+        let names = ffi::rpmtdNew();
+        if ffi::headerGet(h, ffi::RPMTAG_REQUIRENAME, names, 0) != 0 {
+            ffi::rpmtdInit(names);
+            loop {
+                if ffi::rpmtdNext(names) < 0 {
+                    break;
+                }
+                let np = ffi::rpmtdGetString(names);
+                if np.is_null() {
+                    continue;
+                }
+                let n = CStr::from_ptr(np).to_string_lossy();
+                if n.starts_with("rpmlib(") || n.starts_with('(') {
+                    continue;
+                }
+                out.push(n.into_owned());
+            }
+        }
+        ffi::rpmtdFreeData(names);
+        ffi::rpmtdFree(names);
+        out
+    }
+
     unsafe fn collect_reverse_requires(h: ffi::Header, pkg: &str, rd: &mut super::ReverseDeps) {
         let names = ffi::rpmtdNew();
         let flags = ffi::rpmtdNew();
@@ -880,6 +952,9 @@ impl Rpmdb {
     }
     pub fn installed_reverse_deps(&self) -> ReverseDeps {
         ReverseDeps::default()
+    }
+    pub fn installed_packages_deps(&self) -> Vec<InstalledPkg> {
+        Vec::new()
     }
 }
 
