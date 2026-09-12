@@ -51,6 +51,7 @@ impl TestRepo {
             provides: Vec::new(),
             requires: Vec::new(),
             recommends: Vec::new(),
+            conflicts: Vec::new(),
         });
         PkgB {
             c: self.avail.last_mut().unwrap(),
@@ -99,6 +100,10 @@ impl PkgB<'_> {
     }
     pub fn recommends(self, d: &str) -> Self {
         self.c.recommends.push(parse_dep(d));
+        self
+    }
+    pub fn conflicts(self, d: &str) -> Self {
+        self.c.conflicts.push(parse_dep(d));
         self
     }
 }

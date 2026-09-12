@@ -48,6 +48,7 @@ pub struct IPackage {
     pub requires: Vec<IDep>,
     pub recommends: Vec<IDep>,
     pub obsoletes: Vec<IDep>,
+    pub conflicts: Vec<IDep>,
     pub files: Vec<Sym>,
 }
 
@@ -237,6 +238,22 @@ impl<'a> PkgView<'a> {
             .map(|d| self.store.dep(d))
             .collect()
     }
+    /// Owned `Dep`s for Conflicts.
+    pub fn conflicts(&self) -> Vec<Dep> {
+        self.pkg
+            .conflicts
+            .iter()
+            .map(|d| self.store.dep(d))
+            .collect()
+    }
+    /// Conflict capability names, borrowed (for the required-set pre-pass).
+    pub fn conflict_names(&self) -> Vec<&'a str> {
+        self.pkg
+            .conflicts
+            .iter()
+            .map(|d| self.s(d.name.to_native()))
+            .collect()
+    }
     /// Provides plus advertised files (as unversioned provides), keeping only
     /// capabilities whose name is in `keep`. Resolving the name (cheap `&str`)
     /// before building the `Dep` avoids allocating for the many never-required
@@ -294,6 +311,7 @@ impl ArchivedStore {
             requires: p.requires.iter().map(|d| self.dep(d)).collect(),
             recommends: p.recommends.iter().map(|d| self.dep(d)).collect(),
             obsoletes: p.obsoletes.iter().map(|d| self.dep(d)).collect(),
+            conflicts: p.conflicts.iter().map(|d| self.dep(d)).collect(),
             files: p
                 .files
                 .iter()

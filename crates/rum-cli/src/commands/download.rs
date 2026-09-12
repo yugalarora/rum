@@ -407,6 +407,7 @@ impl CandidateSource for MetasSource<'_> {
                 }
                 let requires = p.requires();
                 let recommends = p.recommends();
+                let conflicts = p.conflicts();
                 visit(CandidateRef {
                     id: base + pi,
                     name: p.name(),
@@ -415,6 +416,7 @@ impl CandidateSource for MetasSource<'_> {
                     provides: &provides,
                     requires: &requires,
                     recommends: &recommends,
+                    conflicts: &conflicts,
                 });
             }
         }
@@ -429,12 +431,14 @@ impl CandidateSource for MetasSource<'_> {
                 let provide_names = p.provide_names();
                 let require_names = p.require_names();
                 let recommend_names = p.recommend_names();
+                let conflict_names = p.conflict_names();
                 visit(NameView {
                     name: p.name(),
                     arch: p.arch(),
                     provide_names: &provide_names,
                     require_names: &require_names,
                     recommend_names: &recommend_names,
+                    conflict_names: &conflict_names,
                 });
             }
         }

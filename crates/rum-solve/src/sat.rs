@@ -50,6 +50,9 @@ pub struct CandidateRef<'a> {
     pub provides: &'a [Dep],
     pub requires: &'a [Dep],
     pub recommends: &'a [Dep],
+    /// Capabilities this package conflicts with (modeled as solver constraints
+    /// forbidding coexistence).
+    pub conflicts: &'a [Dep],
 }
 
 /// A name-only view of one candidate, for the cheap pre-passes (which capability
@@ -63,6 +66,9 @@ pub struct NameView<'a> {
     pub provide_names: &'a [&'a str],
     pub require_names: &'a [&'a str],
     pub recommend_names: &'a [&'a str],
+    /// Conflict capability names, so the pool materializes providers for them
+    /// (otherwise a conflict constraint has nothing to bite).
+    pub conflict_names: &'a [&'a str],
 }
 
 /// A source of candidates that can be scanned repeatedly without holding them
@@ -100,6 +106,7 @@ impl CandidateSource for [Candidate] {
                 provides: &provides,
                 requires: &c.requires,
                 recommends: &c.recommends,
+                conflicts: &c.conflicts,
             });
         }
     }
@@ -108,12 +115,14 @@ impl CandidateSource for [Candidate] {
             let pv: Vec<&str> = c.provides.iter().map(|d| d.name.as_str()).collect();
             let rq: Vec<&str> = c.requires.iter().map(|d| d.name.as_str()).collect();
             let rc: Vec<&str> = c.recommends.iter().map(|d| d.name.as_str()).collect();
+            let cf: Vec<&str> = c.conflicts.iter().map(|d| d.name.as_str()).collect();
             visit(NameView {
                 name: &c.name,
                 arch: &c.arch,
                 provide_names: &pv,
                 require_names: &rq,
                 recommend_names: &rc,
+                conflict_names: &cf,
             });
         }
     }
@@ -125,6 +134,10 @@ struct RpmProvider {
     providers: HashMap<NameId, Vec<SolvableId>>,
     /// solvable -> its dependency requirements
     deps: HashMap<SolvableId, Vec<ConditionalRequirement>>,
+    /// solvable -> its constraints (from Conflicts): version sets that any
+    /// co-selected package of that capability MUST satisfy (we store the
+    /// complement of the conflicting range, so conflicting versions are barred).
+    constrains: HashMap<SolvableId, Vec<VersionSetId>>,
     /// solvables that represent already-installed capabilities (preferred, and
     /// excluded from the install output)
     installed: HashSet<SolvableId>,
@@ -145,6 +158,11 @@ struct RpmProvider {
     /// can apply RPM's partial-EVR comparison (e.g. `= 15.0.7` with no release
     /// matches `15.0.7-3.amzn2023.0.4`) instead of an exact Ranges match.
     vsdep: HashMap<VersionSetId, Dep>,
+    /// Version sets that are Conflicts constraints (not requirements). These are
+    /// matched by their raw `Ranges` membership — and, unlike a requirement, a
+    /// wildcard/unversioned provide is NOT exempt (a conflict on a capability
+    /// bars even an unversioned provider of it).
+    constrain_vs: HashSet<VersionSetId>,
 }
 
 /// `rpmlib(...)` feature flags are satisfied by rpm itself, not repo packages.
@@ -380,12 +398,14 @@ fn build<S: CandidateSource + ?Sized>(
     let pool = Pool::<Ranges<Evr>>::new();
     let mut providers: HashMap<NameId, Vec<SolvableId>> = HashMap::new();
     let mut deps: HashMap<SolvableId, Vec<ConditionalRequirement>> = HashMap::new();
+    let mut constrains_map: HashMap<SolvableId, Vec<VersionSetId>> = HashMap::new();
     let mut candidate_of: HashMap<SolvableId, usize> = HashMap::new();
     let mut installed: HashSet<SolvableId> = HashSet::new();
     let mut pkg_evr: HashMap<SolvableId, Evr> = HashMap::new();
     let mut wildcard: HashSet<SolvableId> = HashSet::new();
     let mut conditions: Vec<Condition> = Vec::new();
     let mut vsdep: HashMap<VersionSetId, Dep> = HashMap::new();
+    let mut constrain_vs: HashSet<VersionSetId> = HashSet::new();
     // Installed capability names, for pre-evaluating rich `if`/`unless`.
     let installed_names: HashSet<String> =
         installed_provides.iter().map(|(n, _)| n.clone()).collect();
@@ -437,6 +457,31 @@ fn build<S: CandidateSource + ?Sized>(
             }
         }
 
+        // Conflicts -> resolvo constraints. A `Conflicts: X [op ver]` forbids
+        // co-installing any matching X. resolvo constrains say "a co-selected
+        // solvable of this capability MUST be within version set V", so we store
+        // the COMPLEMENT of the conflicting range as V: the conflicting versions
+        // are then the only ones barred. Unversioned conflict -> forbid all
+        // (complement of full = empty). Rich conflicts are skipped.
+        let mut cons: Vec<VersionSetId> = Vec::new();
+        for x in c.conflicts {
+            if is_ignorable_dep(&x.name) || richdep::is_rich(&x.name) {
+                continue;
+            }
+            let cap = pool.intern_package_name(x.name.clone());
+            let forbidden = match (&x.evr, x.flag) {
+                (None, _) | (_, DepFlag::Any) => Ranges::full(),
+                (Some(e), DepFlag::Eq) => Ranges::singleton(e.clone()),
+                (Some(e), DepFlag::Lt) => Ranges::strictly_lower_than(e.clone()),
+                (Some(e), DepFlag::Le) => Ranges::lower_than(e.clone()),
+                (Some(e), DepFlag::Gt) => Ranges::strictly_higher_than(e.clone()),
+                (Some(e), DepFlag::Ge) => Ranges::higher_than(e.clone()),
+            };
+            let vsid = pool.intern_version_set(cap, forbidden.complement());
+            constrain_vs.insert(vsid);
+            cons.push(vsid);
+        }
+
         // Capabilities this package offers: its own name (versioned, = package
         // EVR) plus every Provides / file. A Provides with no version is
         // unversioned and matches any require (tracked as a wildcard).
@@ -461,6 +506,9 @@ fn build<S: CandidateSource + ?Sized>(
             candidate_of.insert(sid, ci);
             pkg_evr.insert(sid, c.evr.clone());
             deps.insert(sid, reqs.clone());
+            if !cons.is_empty() {
+                constrains_map.insert(sid, cons.clone());
+            }
             if prov_evr.is_none() {
                 wildcard.insert(sid);
             }
@@ -492,12 +540,14 @@ fn build<S: CandidateSource + ?Sized>(
         pool,
         providers,
         deps,
+        constrains: constrains_map,
         installed,
         candidate_of,
         pkg_evr,
         wildcard,
         conditions,
         vsdep,
+        constrain_vs,
     }
 }
 
@@ -542,6 +592,20 @@ impl DependencyProvider for RpmProvider {
         version_set: VersionSetId,
         inverse: bool,
     ) -> Vec<SolvableId> {
+        // Conflicts constraint: match strictly by the version set's raw Ranges
+        // (no wildcard exemption — a conflict on a capability bars even an
+        // unversioned provider of it).
+        if self.constrain_vs.contains(&version_set) {
+            let ranges = self.pool.resolve_version_set(version_set).clone();
+            return candidates
+                .iter()
+                .copied()
+                .filter(|s| {
+                    let rec = &self.pool.resolve_solvable(*s).record;
+                    ranges.contains(rec) != inverse
+                })
+                .collect();
+        }
         let dep = self.vsdep.get(&version_set);
         candidates
             .iter()
@@ -593,7 +657,7 @@ impl DependencyProvider for RpmProvider {
     async fn get_dependencies(&self, solvable: SolvableId) -> Dependencies {
         Dependencies::Known(KnownDependencies {
             requirements: self.deps.get(&solvable).cloned().unwrap_or_default(),
-            constrains: Vec::new(),
+            constrains: self.constrains.get(&solvable).cloned().unwrap_or_default(),
         })
     }
 }
@@ -657,6 +721,13 @@ pub fn resolve_sat_with<S: CandidateSource + ?Sized>(
         for r in c.recommend_names {
             if !is_ignorable_dep(r) && !richdep::is_rich(r) {
                 recommend_names.insert(r.to_string());
+            }
+        }
+        // Materialize conflict targets too (they need provider solvables — incl.
+        // the installed synthetic — for the conflict constraint to bind).
+        for x in c.conflict_names {
+            if !is_ignorable_dep(x) && !richdep::is_rich(x) {
+                hard_required.insert(x.to_string());
             }
         }
     });
@@ -800,6 +871,7 @@ mod tests {
             provides: provides.iter().map(|p| Dep::unversioned(*p)).collect(),
             requires: requires.to_vec(),
             recommends: Vec::new(),
+            conflicts: Vec::new(),
         }
     }
 
@@ -875,6 +947,24 @@ mod tests {
         assert_installs(&r, &["app"], &["app-1-1.x86_64"]);
     }
 
+    // B2 (conflicts at solve time): `app` needs capX and capY. capX is provided
+    // only by px. Of capY's two providers, pyA `Conflicts: capX` — which px (a
+    // required in-transaction package) provides — so pyA can't be co-installed;
+    // the solver must backtrack to pyB instead of dead-ending at rpm commit.
+    #[test]
+    fn conflict_forces_alternative_provider() {
+        let mut r = TestRepo::new();
+        r.pkg("app-1-1.x86_64").requires("capX").requires("capY");
+        r.pkg("px-1-1.x86_64").provides("capX");
+        r.pkg("pyA-1-1.x86_64").provides("capY").conflicts("capX");
+        r.pkg("pyB-1-1.x86_64").provides("capY");
+        assert_installs(
+            &r,
+            &["app"],
+            &["app-1-1.x86_64", "px-1-1.x86_64", "pyB-1-1.x86_64"],
+        );
+    }
+
     // A1 (see [[rum-upstream-research]]): RPM's dependency-overlap rule compares
     // epoch ONLY when both sides carry one. Require `bash >= 2:5.0` vs Provide
     // `bash = 5.2` (no epoch) -> RPM/dnf skip the epoch and 5.2 >= 5.0 satisfies.
@@ -906,6 +996,7 @@ mod tests {
             provides: vec![],
             requires: vec![vprov("lib(x86-64)", "1.0"), vprov("tool(x86-64)", "1.0")],
             recommends: vec![],
+            conflicts: vec![],
         };
         // lib and tool each carry a versioned arch-qualified provide.
         let lib = Candidate {
@@ -916,6 +1007,7 @@ mod tests {
             provides: vec![vprov("lib(x86-64)", "1.0")],
             requires: vec![],
             recommends: vec![],
+            conflicts: vec![],
         };
         let tool = Candidate {
             id: 2,
@@ -925,6 +1017,7 @@ mod tests {
             provides: vec![vprov("tool(x86-64)", "1.0")],
             requires: vec![],
             recommends: vec![],
+            conflicts: vec![],
         };
         let r = resolve_sat(&["app".into()], &[app, lib, tool], &[])
             .unwrap()
@@ -984,6 +1077,7 @@ mod tests {
                 evr: Some(Evr::new(Some(0), "15.0.7", "")), // version only, no release
             }],
             recommends: vec![],
+            conflicts: vec![],
         };
         let prov = Candidate {
             id: 1,
@@ -997,6 +1091,7 @@ mod tests {
             }],
             requires: vec![],
             recommends: vec![],
+            conflicts: vec![],
         };
         let r = resolve_sat(&["app".into()], &[app, prov], &[])
             .unwrap()
