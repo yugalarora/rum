@@ -13,6 +13,8 @@ mod dep;
 mod resolve;
 mod richdep;
 mod sat;
+#[cfg(test)]
+mod testsupport;
 mod vercmp;
 
 use std::cmp::Ordering;

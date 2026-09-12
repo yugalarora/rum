@@ -786,6 +786,7 @@ fn attempt<S: CandidateSource + ?Sized>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testsupport::{assert_installs, assert_unsolvable, TestRepo};
 
     fn dep(name: &str) -> Dep {
         Dep::unversioned(name)
@@ -804,29 +805,26 @@ mod tests {
 
     #[test]
     fn resolves_transitive_chain() {
-        let cands = vec![
-            cand(0, "app", "1.0", &[], &[dep("libb.so")]),
-            cand(1, "libb", "1.0", &["libb.so"], &[dep("libc.so")]),
-            cand(2, "libc", "1.0", &["libc.so"], &[]),
-        ];
-        let mut r = resolve_sat(&["app".into()], &cands, &[])
-            .unwrap()
-            .to_install;
-        r.sort();
-        assert_eq!(r, vec![0, 1, 2]);
+        let mut r = TestRepo::new();
+        r.pkg("app-1.0-1.x86_64").requires("libb.so");
+        r.pkg("libb-1.0-1.x86_64")
+            .provides("libb.so")
+            .requires("libc.so");
+        r.pkg("libc-1.0-1.x86_64").provides("libc.so");
+        assert_installs(
+            &r,
+            &["app"],
+            &["app-1.0-1.x86_64", "libb-1.0-1.x86_64", "libc-1.0-1.x86_64"],
+        );
     }
 
     #[test]
     fn prunes_installed() {
-        let cands = vec![
-            cand(0, "app", "1.0", &[], &[dep("libc.so")]),
-            cand(1, "libc", "1.0", &["libc.so"], &[]),
-        ];
-        let installed = vec![("libc.so".to_string(), None)];
-        let r = resolve_sat(&["app".into()], &cands, &installed)
-            .unwrap()
-            .to_install;
-        assert_eq!(r, vec![0]); // libc.so already provided by system
+        let mut r = TestRepo::new();
+        r.pkg("app-1.0-1.x86_64").requires("libc.so");
+        r.pkg("libc-1.0-1.x86_64").provides("libc.so");
+        r.installed("libc.so"); // already provided by the system
+        assert_installs(&r, &["app"], &["app-1.0-1.x86_64"]);
     }
 
     #[test]
@@ -834,52 +832,62 @@ mod tests {
         // `cap` has two providers: prov-2 (newest) needs `missing` (unsatisfiable),
         // prov-1 (older) is self-contained. A greedy "newest wins" picks prov-2
         // and fails; a backtracking solver must fall back to prov-1.
-        let cands = vec![
-            cand(0, "app", "1.0", &[], &[dep("cap")]),
-            cand(1, "prov", "1.0", &["cap"], &[]),
-            cand(2, "prov", "2.0", &["cap"], &[dep("missing")]),
-        ];
-        let r = resolve_sat(&["app".into()], &cands, &[])
-            .unwrap()
-            .to_install;
-        assert!(r.contains(&0), "app selected");
-        assert!(r.contains(&1), "fell back to prov-1.0");
-        assert!(!r.contains(&2), "prov-2.0 (dead end) not selected");
+        let mut r = TestRepo::new();
+        r.pkg("app-1.0-1.x86_64").requires("cap");
+        r.pkg("prov-1.0-1.x86_64").provides("cap");
+        r.pkg("prov-2.0-1.x86_64")
+            .provides("cap")
+            .requires("missing");
+        assert_installs(&r, &["app"], &["app-1.0-1.x86_64", "prov-1.0-1.x86_64"]);
     }
 
     #[test]
     fn unversioned_provide_satisfies_versioned_require() {
         // RPM rule: a versionless `Provides: webserver` satisfies
         // `Requires: webserver >= 5.0`, even though the package is v3.0.
-        let app = Candidate {
-            id: 0,
-            name: "app".into(),
-            arch: "x86_64".into(),
-            evr: Evr::new(Some(0), "1", "1"),
-            provides: vec![],
-            requires: vec![Dep {
-                name: "webserver".into(),
-                flag: DepFlag::Ge,
-                evr: Some(Evr::new(Some(0), "5.0", "")),
-            }],
-            recommends: vec![],
-        };
-        let prov = Candidate {
-            id: 1,
-            name: "prov".into(),
-            arch: "x86_64".into(),
-            evr: Evr::new(Some(0), "3.0", "1"), // package older than the require
-            provides: vec![Dep::unversioned("webserver")], // unversioned provide
-            requires: vec![],
-            recommends: vec![],
-        };
-        let r = resolve_sat(&["app".into()], &[app, prov], &[])
-            .unwrap()
-            .to_install;
-        assert!(
-            r.contains(&1),
-            "unversioned provide must satisfy a versioned require"
-        );
+        let mut r = TestRepo::new();
+        r.pkg("app-1-1.x86_64").requires("webserver >= 5.0");
+        r.pkg("prov-3.0-1.x86_64").provides("webserver");
+        assert_installs(&r, &["app"], &["app-1-1.x86_64", "prov-3.0-1.x86_64"]);
+    }
+
+    #[test]
+    fn unsatisfiable_require_fails() {
+        let mut r = TestRepo::new();
+        r.pkg("app-1-1.x86_64").requires("nonexistent");
+        assert_unsolvable(&r, &["app"]);
+    }
+
+    #[test]
+    fn recommends_pulled_when_satisfiable() {
+        // rum installs Recommends by default (dnf install_weak_deps=1).
+        let mut r = TestRepo::new();
+        r.pkg("app-1-1.x86_64").recommends("extra");
+        r.pkg("extra-1-1.x86_64").provides("extra");
+        assert_installs(&r, &["app"], &["app-1-1.x86_64", "extra-1-1.x86_64"]);
+    }
+
+    #[test]
+    fn recommends_dropped_when_unsatisfiable() {
+        // A missing weak dep must not fail the transaction — app still installs.
+        let mut r = TestRepo::new();
+        r.pkg("app-1-1.x86_64").recommends("absent");
+        assert_installs(&r, &["app"], &["app-1-1.x86_64"]);
+    }
+
+    // Gap-driver A1 (see [[rum-upstream-research]]): RPM's dependency-overlap
+    // rule compares epoch ONLY when both sides carry one. Require `bash >= 2:5.0`
+    // vs Provide `bash = 5.2` (no epoch) -> RPM/dnf skip the epoch and 5.2 >= 5.0
+    // satisfies. rum currently treats a missing epoch as 0 (0 < 2) and wrongly
+    // rejects. Ignored until Evr carries absent-vs-0 epoch and compare_partial
+    // skips epoch when either side lacks it.
+    #[test]
+    #[ignore = "A1 epoch-overlap: needs Evr absent-epoch; tracked in rum-upstream-research"]
+    fn epoch_skipped_in_overlap_when_provide_has_none() {
+        let mut r = TestRepo::new();
+        r.pkg("app-1-1.x86_64").requires("bash >= 2:5.0");
+        r.pkg("bash-5.2-1.x86_64").provides("bash = 5.2");
+        assert_installs(&r, &["app"], &["app-1-1.x86_64", "bash-5.2-1.x86_64"]);
     }
 
     #[test]
