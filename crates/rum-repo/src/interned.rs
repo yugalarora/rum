@@ -315,7 +315,9 @@ fn dep_flag(a: &ArchivedDepFlag) -> DepFlag {
 fn checksum_kind(a: &ArchivedChecksumKind) -> ChecksumKind {
     match a {
         ArchivedChecksumKind::Sha1 => ChecksumKind::Sha1,
+        ArchivedChecksumKind::Sha224 => ChecksumKind::Sha224,
         ArchivedChecksumKind::Sha256 => ChecksumKind::Sha256,
+        ArchivedChecksumKind::Sha384 => ChecksumKind::Sha384,
         ArchivedChecksumKind::Sha512 => ChecksumKind::Sha512,
     }
 }

@@ -270,7 +270,17 @@ impl Builder {
         if self.name.is_empty() || self.version.is_empty() || self.location.is_empty() {
             return None;
         }
-        let checksum = self.checksum?;
+        // A package with no usable checksum (missing, or an unsupported `type=`)
+        // can't be verified after download, so it's dropped — but noisily, not
+        // silently, since an unknown checksum type would otherwise make a whole
+        // repo vanish with no explanation.
+        let Some(checksum) = self.checksum else {
+            tracing::warn!(
+                package = %self.name,
+                "skipping package with missing or unsupported checksum type"
+            );
+            return None;
+        };
         let idep = |itn: &mut Interner, d: &Dep| IDep {
             name: itn.intern(&d.name),
             evr: itn.intern_evr(&d.evr),
