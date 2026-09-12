@@ -150,3 +150,28 @@ pub fn privileged(prog: &str) -> std::process::Command {
         c
     }
 }
+
+/// Package names that must never be removed by a rum transaction — removing any
+/// would break the system or the package manager itself. Mirrors dnf's
+/// `protected_packages` defaults (plus rum itself). The running kernel is
+/// protected separately (its NEVRA is version-specific); see
+/// [`running_kernel_release`].
+pub fn protected_packages() -> &'static [&'static str] {
+    &["rum", "dnf", "yum", "systemd", "glibc", "bash"]
+}
+
+/// The running kernel's release string (e.g. `6.12.0-55.el10.x86_64`), used to
+/// refuse removing the kernel the system is currently booted on. `None` off
+/// Linux or if it can't be read.
+#[cfg(target_os = "linux")]
+pub fn running_kernel_release() -> Option<String> {
+    std::fs::read_to_string("/proc/sys/kernel/osrelease")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn running_kernel_release() -> Option<String> {
+    None
+}

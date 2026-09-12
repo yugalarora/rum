@@ -32,6 +32,28 @@ pub fn run(packages: &[String], assume_yes: bool) -> anyhow::Result<()> {
         anyhow::bail!("not installed: {}", missing.join(", "));
     }
 
+    // Protected-package safety (dnf's protected_packages): never remove a
+    // package that would break the system or rum itself, nor the running
+    // kernel. rpm would happily erase these; we refuse before committing.
+    let protected = sys::protected_packages();
+    if let Some(spec) = packages.iter().find(|s| protected.contains(&s.as_str())) {
+        anyhow::bail!("refusing to remove protected package `{spec}`");
+    }
+    if let Some(running) = sys::running_kernel_release() {
+        for spec in packages {
+            if spec.starts_with("kernel")
+                && db
+                    .by_name(spec)
+                    .iter()
+                    .any(|p| p.nevra().contains(&running))
+            {
+                anyhow::bail!(
+                    "refusing to remove the running kernel ({running}); boot another kernel first"
+                );
+            }
+        }
+    }
+
     println!("Removing {} package(s):", matched.len());
     matched.sort();
     for n in &matched {
