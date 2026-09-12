@@ -36,6 +36,12 @@ pub struct AvailablePackage {
     pub provides: Vec<Dep>,
     /// Capabilities this package requires (from `<format><rpm:requires>`).
     pub requires: Vec<Dep>,
+    /// Capabilities this package obsoletes (from `<format><rpm:obsoletes>`);
+    /// installing it removes/replaces any installed package matching these.
+    pub obsoletes: Vec<Dep>,
+    /// Capabilities this package conflicts with (from `<format><rpm:conflicts>`);
+    /// it cannot be installed alongside a package matching these.
+    pub conflicts: Vec<Dep>,
     /// Weak dependencies (from `<format><rpm:recommends>`); installed by
     /// default when satisfiable, matching dnf's `install_weak_deps=1`.
     pub recommends: Vec<Dep>,
@@ -111,8 +117,11 @@ pub fn parse_reader<R: std::io::Read>(input: R, repo_id: &str) -> Result<Store, 
                                 b"provides" => dep_ctx = DepCtx::Provides,
                                 b"requires" => dep_ctx = DepCtx::Requires,
                                 b"recommends" => dep_ctx = DepCtx::Recommends,
-                                b"conflicts" | b"obsoletes" | b"suggests" | b"enhances"
-                                | b"supplements" => dep_ctx = DepCtx::None,
+                                b"obsoletes" => dep_ctx = DepCtx::Obsoletes,
+                                b"conflicts" => dep_ctx = DepCtx::Conflicts,
+                                b"suggests" | b"enhances" | b"supplements" => {
+                                    dep_ctx = DepCtx::None
+                                }
                                 b"file" => field = Field::File,
                                 b"entry" => push_entry(b, dep_ctx, &e),
                                 _ => field = Field::None,
@@ -202,6 +211,8 @@ enum DepCtx {
     Provides,
     Requires,
     Recommends,
+    Obsoletes,
+    Conflicts,
 }
 
 /// Push an `<rpm:entry>` into the provides/requires list per the active context.
@@ -214,6 +225,8 @@ fn push_entry(b: &mut Builder, ctx: DepCtx, e: &quick_xml::events::BytesStart) {
             DepCtx::Provides => b.provides.push(d),
             DepCtx::Requires => b.requires.push(d),
             DepCtx::Recommends => b.recommends.push(d),
+            DepCtx::Obsoletes => b.obsoletes.push(d),
+            DepCtx::Conflicts => b.conflicts.push(d),
             DepCtx::None => {}
         }
     }
@@ -248,6 +261,8 @@ struct Builder {
     provides: Vec<Dep>,
     requires: Vec<Dep>,
     recommends: Vec<Dep>,
+    obsoletes: Vec<Dep>,
+    conflicts: Vec<Dep>,
     files: Vec<String>,
 }
 
@@ -270,7 +285,17 @@ impl Builder {
         if self.name.is_empty() || self.version.is_empty() || self.location.is_empty() {
             return None;
         }
-        let checksum = self.checksum?;
+        // A package with no usable checksum (missing, or an unsupported `type=`)
+        // can't be verified after download, so it's dropped — but noisily, not
+        // silently, since an unknown checksum type would otherwise make a whole
+        // repo vanish with no explanation.
+        let Some(checksum) = self.checksum else {
+            tracing::warn!(
+                package = %self.name,
+                "skipping package with missing or unsupported checksum type"
+            );
+            return None;
+        };
         let idep = |itn: &mut Interner, d: &Dep| IDep {
             name: itn.intern(&d.name),
             evr: itn.intern_evr(&d.evr),
@@ -291,6 +316,8 @@ impl Builder {
             provides: self.provides.iter().map(|d| idep(itn, d)).collect(),
             requires: self.requires.iter().map(|d| idep(itn, d)).collect(),
             recommends: self.recommends.iter().map(|d| idep(itn, d)).collect(),
+            obsoletes: self.obsoletes.iter().map(|d| idep(itn, d)).collect(),
+            conflicts: self.conflicts.iter().map(|d| idep(itn, d)).collect(),
             files: self.files.iter().map(|f| itn.intern(f)).collect(),
         })
     }
@@ -336,6 +363,12 @@ mod tests {
               <rpm:recommends>
                 <rpm:entry name="bash-completion"/>
               </rpm:recommends>
+              <rpm:obsoletes>
+                <rpm:entry name="bash-legacy" flags="LT" epoch="0" ver="4.0"/>
+              </rpm:obsoletes>
+              <rpm:conflicts>
+                <rpm:entry name="bash-broken"/>
+              </rpm:conflicts>
               <file>/usr/bin/bash</file>
               <file type="dir">/etc/bash</file>
               <checksum>should-not-be-picked</checksum>
@@ -380,6 +413,11 @@ mod tests {
         assert!(bash.requires[1].evr.is_none()); // /bin/sh unversioned
         assert_eq!(bash.recommends.len(), 1);
         assert_eq!(bash.recommends[0].name, "bash-completion");
+        assert_eq!(bash.obsoletes.len(), 1);
+        assert_eq!(bash.obsoletes[0].name, "bash-legacy");
+        assert_eq!(bash.obsoletes[0].flag, rum_solve::DepFlag::Lt);
+        assert_eq!(bash.conflicts.len(), 1);
+        assert_eq!(bash.conflicts[0].name, "bash-broken");
         assert_eq!(bash.files, vec!["/usr/bin/bash", "/etc/bash"]);
 
         let zlib = &pkgs[1];

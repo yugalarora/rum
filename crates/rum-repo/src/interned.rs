@@ -47,6 +47,8 @@ pub struct IPackage {
     pub provides: Vec<IDep>,
     pub requires: Vec<IDep>,
     pub recommends: Vec<IDep>,
+    pub obsoletes: Vec<IDep>,
+    pub conflicts: Vec<IDep>,
     pub files: Vec<Sym>,
 }
 
@@ -78,9 +80,11 @@ impl Interner {
         self.rodeo.get_or_intern(s).into_usize() as Sym
     }
 
-    /// Intern an optional EVR (stored as its display string).
+    /// Intern an optional EVR. Uses the lossless `to_dep_string()` (not Display)
+    /// so an explicit `0:` epoch survives the round-trip distinct from an absent
+    /// one — the dependency-overlap rule relies on that distinction.
     pub fn intern_evr(&mut self, evr: &Option<Evr>) -> Option<Sym> {
-        evr.as_ref().map(|e| self.intern(&e.to_string()))
+        evr.as_ref().map(|e| self.intern(&e.to_dep_string()))
     }
 
     /// Materialize the interned strings in symbol order (`strings[sym]`).
@@ -226,6 +230,30 @@ impl<'a> PkgView<'a> {
             .map(|d| self.store.dep(d))
             .collect()
     }
+    /// Owned `Dep`s for Obsoletes.
+    pub fn obsoletes(&self) -> Vec<Dep> {
+        self.pkg
+            .obsoletes
+            .iter()
+            .map(|d| self.store.dep(d))
+            .collect()
+    }
+    /// Owned `Dep`s for Conflicts.
+    pub fn conflicts(&self) -> Vec<Dep> {
+        self.pkg
+            .conflicts
+            .iter()
+            .map(|d| self.store.dep(d))
+            .collect()
+    }
+    /// Conflict capability names, borrowed (for the required-set pre-pass).
+    pub fn conflict_names(&self) -> Vec<&'a str> {
+        self.pkg
+            .conflicts
+            .iter()
+            .map(|d| self.s(d.name.to_native()))
+            .collect()
+    }
     /// Provides plus advertised files (as unversioned provides), keeping only
     /// capabilities whose name is in `keep`. Resolving the name (cheap `&str`)
     /// before building the `Dep` avoids allocating for the many never-required
@@ -282,6 +310,8 @@ impl ArchivedStore {
             provides: p.provides.iter().map(|d| self.dep(d)).collect(),
             requires: p.requires.iter().map(|d| self.dep(d)).collect(),
             recommends: p.recommends.iter().map(|d| self.dep(d)).collect(),
+            obsoletes: p.obsoletes.iter().map(|d| self.dep(d)).collect(),
+            conflicts: p.conflicts.iter().map(|d| self.dep(d)).collect(),
             files: p
                 .files
                 .iter()
@@ -313,7 +343,9 @@ fn dep_flag(a: &ArchivedDepFlag) -> DepFlag {
 fn checksum_kind(a: &ArchivedChecksumKind) -> ChecksumKind {
     match a {
         ArchivedChecksumKind::Sha1 => ChecksumKind::Sha1,
+        ArchivedChecksumKind::Sha224 => ChecksumKind::Sha224,
         ArchivedChecksumKind::Sha256 => ChecksumKind::Sha256,
+        ArchivedChecksumKind::Sha384 => ChecksumKind::Sha384,
         ArchivedChecksumKind::Sha512 => ChecksumKind::Sha512,
     }
 }

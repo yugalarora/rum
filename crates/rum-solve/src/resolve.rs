@@ -24,6 +24,9 @@ pub struct Candidate {
     pub requires: Vec<Dep>,
     /// Weak dependencies (Recommends): pulled best-effort when satisfiable.
     pub recommends: Vec<Dep>,
+    /// Capabilities this package conflicts with: it cannot coexist with a
+    /// package matching these (modeled as a solver constraint). Empty for most.
+    pub conflicts: Vec<Dep>,
 }
 
 /// The outcome of a resolve: the candidate ids to install, in a stable order.
@@ -254,6 +257,7 @@ mod tests {
             provides: provides.iter().map(|p| Dep::unversioned(*p)).collect(),
             requires: requires.to_vec(),
             recommends: Vec::new(),
+            conflicts: Vec::new(),
         }
     }
 
@@ -339,6 +343,7 @@ mod tests {
                     evr: Some(Evr::new(Some(0), "2.34", "")),
                 }],
                 recommends: Vec::new(),
+                conflicts: Vec::new(),
             },
             cand(2, "glibc", "2.40", &[], &[]),
         ];

@@ -102,9 +102,15 @@ impl Dep {
 /// releases are ignored; likewise a bare version (no release) compares only
 /// epoch+version.
 fn compare_partial(a: &Evr, b: &Evr) -> Ordering {
-    let epoch = a.epoch.cmp(&b.epoch);
-    if epoch != Ordering::Equal {
-        return epoch;
+    // RPM's overlap rule compares epoch ONLY when both sides carry one
+    // (`rpmver.c`: `if (v1->e && *v1->e && v2->e && *v2->e)`). An absent epoch
+    // on either side is a wildcard, NOT 0 — so e.g. Provide `bash = 5.2` (no
+    // epoch) satisfies Require `bash >= 2:5.0`.
+    if let (Some(ae), Some(be)) = (a.epoch, b.epoch) {
+        match ae.cmp(&be) {
+            Ordering::Equal => {}
+            ne => return ne,
+        }
     }
     let ver = crate::rpmvercmp(&a.version, &b.version);
     if ver != Ordering::Equal {

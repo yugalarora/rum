@@ -238,7 +238,12 @@ pub fn resolve_packages(packages: &[String], with_deps: bool) -> anyhow::Result<
                         continue;
                     };
                     for (rqr, reqver) in requirers {
-                        if seen.contains(rqr) || Evr::parse(reqver) == w_evr {
+                        // Label comparison (epoch-normalized): the require string
+                        // may omit the epoch that `w_evr` carries, so structural
+                        // `==` would spuriously differ post the Evr epoch change.
+                        if seen.contains(rqr)
+                            || Evr::parse(reqver).compare(&w_evr) == std::cmp::Ordering::Equal
+                        {
                             continue;
                         }
                         // The co-built sibling build that pins the NEW version
@@ -285,7 +290,8 @@ pub fn resolve_packages(packages: &[String], with_deps: bool) -> anyhow::Result<
                         let want_evr = then.evr.clone();
                         let installed_ok = match &want_evr {
                             Some(v) => db.by_name(&then.name).iter().any(|p| {
-                                &Evr::new(Some(p.epoch.unwrap_or(0)), &p.version, &p.release) == v
+                                Evr::new(p.epoch, &p.version, &p.release).compare(v)
+                                    == std::cmp::Ordering::Equal
                             }),
                             None => db.is_installed(&then.name),
                         };
@@ -307,6 +313,51 @@ pub fn resolve_packages(packages: &[String], with_deps: bool) -> anyhow::Result<
                     }
                     if !added {
                         break;
+                    }
+                }
+
+                // Obsoletes replacement (B1). dnf's obsoletes processing: when
+                // the transaction touches an installed package that an available
+                // package Obsoletes, pull the obsoleter in so it REPLACES the
+                // obsoleted one — rpm erases the obsoleted at commit because the
+                // obsoleter is in the transaction. Scoped to the transaction's
+                // lineage (installed packages that are requested or being
+                // upgraded), NOT a global system sweep, matching dnf.
+                let affected: HashSet<String> = requested
+                    .iter()
+                    .cloned()
+                    .chain(seen.iter().cloned())
+                    .collect();
+                let installed: Vec<(String, Evr)> = db
+                    .installed()
+                    .into_iter()
+                    .filter(|p| affected.contains(&p.name))
+                    .map(|p| (p.name.clone(), Evr::new(p.epoch, p.version, p.release)))
+                    .collect();
+                if !installed.is_empty() {
+                    for (ri, m) in metas.iter().enumerate() {
+                        for (pi, p) in m.views().enumerate() {
+                            let obs = p.obsoletes();
+                            if obs.is_empty() {
+                                continue;
+                            }
+                            let replaces = installed.iter().any(|(iname, ievr)| {
+                                obs.iter().any(|o| o.satisfied_by(iname, Some(ievr)))
+                            });
+                            if !replaces {
+                                continue;
+                            }
+                            let name = p.name().to_string();
+                            // Skip if already a winner or already installed (only
+                            // pull a NEW obsoleter that isn't in the plan yet).
+                            if seen.contains(&name) || db.is_installed(&name) {
+                                continue;
+                            }
+                            if let Some(pkg) = rehydrate(offsets[ri] + pi) {
+                                seen.insert(name);
+                                winners.push(pkg);
+                            }
+                        }
                     }
                 }
             }
@@ -356,6 +407,7 @@ impl CandidateSource for MetasSource<'_> {
                 }
                 let requires = p.requires();
                 let recommends = p.recommends();
+                let conflicts = p.conflicts();
                 visit(CandidateRef {
                     id: base + pi,
                     name: p.name(),
@@ -364,6 +416,7 @@ impl CandidateSource for MetasSource<'_> {
                     provides: &provides,
                     requires: &requires,
                     recommends: &recommends,
+                    conflicts: &conflicts,
                 });
             }
         }
@@ -378,12 +431,14 @@ impl CandidateSource for MetasSource<'_> {
                 let provide_names = p.provide_names();
                 let require_names = p.require_names();
                 let recommend_names = p.recommend_names();
+                let conflict_names = p.conflict_names();
                 visit(NameView {
                     name: p.name(),
                     arch: p.arch(),
                     provide_names: &provide_names,
                     require_names: &require_names,
                     recommend_names: &recommend_names,
+                    conflict_names: &conflict_names,
                 });
             }
         }
