@@ -57,6 +57,7 @@ pub fn sync_enabled(force_refresh: bool) -> anyhow::Result<Synced> {
     let opts = SyncOptions {
         cachedir: sys::effective_cachedir(&config.main.cachedir),
         force_refresh,
+        vars: config.vars.clone(),
     };
 
     let start = Instant::now();
@@ -113,6 +114,7 @@ pub fn load_filelists(wanted: &std::collections::HashSet<String>) -> Vec<(String
     let opts = SyncOptions {
         cachedir: sys::effective_cachedir(&config.main.cachedir),
         force_refresh: false,
+        vars: config.vars.clone(),
     };
     let mut out = Vec::new();
     for r in config.enabled_repos() {

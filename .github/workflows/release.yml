@@ -18,13 +18,15 @@ jobs:
   # Build one tarball per (era x arch), on a native runner of that arch, inside
   # a representative image of that era so the binary links the matching librpm.
   build:
-    name: build (el${{ matrix.el }}, ${{ matrix.platform.arch }})
+    name: build (el${{ matrix.era.el }}, ${{ matrix.platform.arch }})
     runs-on: ${{ matrix.platform.runner }}
-    container: ${{ matrix.image }}
+    container: ${{ matrix.era.image }}
     strategy:
       fail-fast: false
       matrix:
-        include:
+        # Two explicit dimensions so era x platform cross-products cleanly.
+        # (Mixing `include` with a base dimension collapses to last-wins.)
+        era:
           - { el: 8, image: "oraclelinux:8" }
           - { el: 9, image: "almalinux:9" }
           - { el: 10, image: "almalinux:10" }
@@ -52,7 +54,7 @@ jobs:
           . "$HOME/.cargo/env"
           version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
           arch=$(uname -m)
-          name="rum-${version}-${arch}-el${{ matrix.el }}"
+          name="rum-${version}-${arch}-el${{ matrix.era.el }}"
           install -Dm755 target/release/rum "dist/${name}/rum"
           cp README.md LICENSE "dist/${name}/" 2>/dev/null || true
           tar -C dist -czf "${name}.tar.gz" "${name}"
@@ -61,7 +63,7 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: rum-el${{ matrix.el }}-${{ matrix.platform.arch }}
+          name: rum-el${{ matrix.era.el }}-${{ matrix.platform.arch }}
           path: |
             rum-*.tar.gz
             rum-*.tar.gz.sha256

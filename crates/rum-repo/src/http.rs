@@ -6,7 +6,7 @@ use std::time::Duration;
 use base64::Engine;
 
 use crate::RepoError;
-use rum_config::{Repo, RepoSource};
+use rum_config::{Repo, RepoSource, Vars};
 
 // AWS RHUI (Red Hat's Update Infrastructure on EC2) authorizes content requests
 // with two HTTP headers carrying the instance's signed identity, injected by
@@ -90,12 +90,24 @@ impl Http {
 
     /// Resolve a repo source into a list of candidate base URLs (each is a
     /// directory under which `repodata/repomd.xml` is expected), best first.
-    pub fn resolve_baseurls(&self, source: &RepoSource) -> Result<Vec<String>, RepoError> {
+    ///
+    /// URLs returned in a mirrorlist/metalink body may still contain yum
+    /// variables (AlmaLinux's mirrorlist emits `.../$basearch/os/`, expecting
+    /// the client to substitute), so every resolved URL is variable-expanded
+    /// with `vars` — the same substitution the repo file itself gets.
+    pub fn resolve_baseurls(
+        &self,
+        source: &RepoSource,
+        vars: &Vars,
+    ) -> Result<Vec<String>, RepoError> {
         match source {
             RepoSource::BaseUrls(urls) => Ok(urls.iter().map(|u| trim_trailing_slash(u)).collect()),
             RepoSource::MirrorList(url) => {
                 let text = self.get_text(url)?;
-                let mut urls = parse_mirrorlist(&text);
+                let mut urls: Vec<String> = parse_mirrorlist(&text)
+                    .iter()
+                    .map(|u| trim_trailing_slash(&vars.expand(u)))
+                    .collect();
                 // Red Hat RHUI's Pulp "mirror" endpoint is itself a working
                 // base URL (repodata lives directly under it), even though the
                 // URL it lists in its body may return 403. Add the mirrorlist
@@ -106,7 +118,10 @@ impl Http {
             }
             RepoSource::MetaLink(url) => {
                 let text = self.get_text(url)?;
-                let urls = parse_metalink_baseurls(&text);
+                let urls: Vec<String> = parse_metalink_baseurls(&text)
+                    .iter()
+                    .map(|u| vars.expand(u))
+                    .collect();
                 if urls.is_empty() {
                     return Err(RepoError::NoMirrors(url.clone()));
                 }
@@ -320,5 +335,23 @@ mod tests {
         </resources></file></files></metalink>"#;
         let urls = parse_metalink_baseurls(xml);
         assert_eq!(urls, vec!["https://m1.example/os", "https://m2.example/os"]);
+    }
+
+    #[test]
+    fn mirrorlist_urls_get_variable_expanded() {
+        // AlmaLinux's mirrorlist body returns URLs that still contain
+        // $basearch; the client must substitute (dnf does). Expanding each
+        // parsed URL with the repo's vars is what resolve_baseurls does.
+        let mut vars = Vars::empty();
+        vars.insert("basearch", "x86_64");
+        let body = "http://mirror.example/almalinux/9.8/BaseOS/$basearch/os/\n";
+        let expanded: Vec<String> = parse_mirrorlist(body)
+            .iter()
+            .map(|u| trim_trailing_slash(&vars.expand(u)))
+            .collect();
+        assert_eq!(
+            expanded,
+            vec!["http://mirror.example/almalinux/9.8/BaseOS/x86_64/os"]
+        );
     }
 }
