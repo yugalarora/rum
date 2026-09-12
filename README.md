@@ -76,6 +76,18 @@ CentOS Stream** — across the sqlite and BerkeleyDB rpmdb backends.
 
 ## Installation
 
+### Quick install (recommended)
+
+One command detects your CPU architecture and RPM era, downloads the matching
+release binary, verifies its checksum, and installs it:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/yugalarora/rum/main/scripts/install.sh | sh
+```
+
+Override detection with `RUM_ARCH`, `RUM_EL`, `RUM_VERSION`, or `RUM_BINDIR` if
+needed (e.g. `RUM_BINDIR=$HOME/.local/bin` for a rootless install).
+
 ### From a release binary
 
 Binaries are published for **x86_64** and **aarch64**, one per RPM era (rum
