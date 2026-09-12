@@ -36,10 +36,13 @@ jobs:
     steps:
       - name: Install toolchain
         run: |
-          set -eux
-          dnf install -y --allowerasing gcc rpm-devel popt-devel openssl-devel pkgconfig git tar gzip which findutils
+          set -eu
+          # Distro mirrors flake intermittently; retry so a transient dnf/network
+          # failure doesn't fail the whole (all-arches-required) release.
+          retry() { for i in 1 2 3; do "$@" && return 0; echo "attempt $i failed; retrying in 15s"; sleep 15; done; return 1; }
+          retry dnf install -y --allowerasing gcc rpm-devel popt-devel openssl-devel pkgconfig git tar gzip which findutils
           # rustup for a uniform, MSRV-satisfying toolchain (distro rust on el8 lags).
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+          retry sh -c "curl --proto =https --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable"
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       - uses: actions/checkout@v4
