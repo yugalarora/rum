@@ -36,13 +36,15 @@ jobs:
     steps:
       - name: Install toolchain
         run: |
-          set -eux
+          set -eu
+          # Distro mirrors flake intermittently; retry transient failures.
+          retry() { for i in 1 2 3; do "$@" && return 0; echo "attempt $i failed; retrying in 15s"; sleep 15; done; return 1; }
           # curl-minimal ships in the base images; add build deps. --allowerasing
           # avoids the curl/curl-minimal conflict some images hit.
-          dnf install -y --allowerasing gcc rpm-devel git tar gzip which findutils diffutils
+          retry dnf install -y --allowerasing gcc rpm-devel git tar gzip which findutils diffutils
           # Use rustup for a uniform, MSRV-satisfying toolchain across distros
           # whose packaged rust may lag rum's MSRV.
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+          retry sh -c "curl --proto =https --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable"
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       - uses: actions/checkout@v4
