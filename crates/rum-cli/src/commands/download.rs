@@ -389,7 +389,13 @@ pub fn resolve_packages(packages: &[String], with_deps: bool) -> anyhow::Result<
                                 continue;
                             }
                             let evr = p.evr_cmp();
-                            if best.as_ref().map_or(true, |(_, b)| evr > *b) {
+                            // (explicit match, not map_or/is_none_or: keeps MSRV
+                            // 1.81 while satisfying clippy's unnecessary_map_or)
+                            let better = match &best {
+                                Some((_, b)) => evr > *b,
+                                None => true,
+                            };
+                            if better {
                                 best = Some((offsets[ri] + pi, evr));
                             }
                         }
@@ -400,7 +406,10 @@ pub fn resolve_packages(packages: &[String], with_deps: bool) -> anyhow::Result<
                             .iter()
                             .map(|q| Evr::new(q.epoch, &q.version, &q.release))
                             .max();
-                        let newer = newest_installed.as_ref().map_or(true, |ni| evr > *ni);
+                        let newer = match &newest_installed {
+                            Some(ni) => evr > *ni,
+                            None => true,
+                        };
                         if newer && !seen.contains(spec) {
                             if let Some(pkg) = rehydrate(gid) {
                                 seen.insert(spec.clone());
