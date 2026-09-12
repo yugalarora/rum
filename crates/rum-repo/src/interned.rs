@@ -78,9 +78,11 @@ impl Interner {
         self.rodeo.get_or_intern(s).into_usize() as Sym
     }
 
-    /// Intern an optional EVR (stored as its display string).
+    /// Intern an optional EVR. Uses the lossless `to_dep_string()` (not Display)
+    /// so an explicit `0:` epoch survives the round-trip distinct from an absent
+    /// one — the dependency-overlap rule relies on that distinction.
     pub fn intern_evr(&mut self, evr: &Option<Evr>) -> Option<Sym> {
-        evr.as_ref().map(|e| self.intern(&e.to_string()))
+        evr.as_ref().map(|e| self.intern(&e.to_dep_string()))
     }
 
     /// Materialize the interned strings in symbol order (`strings[sym]`).

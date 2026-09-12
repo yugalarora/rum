@@ -875,14 +875,10 @@ mod tests {
         assert_installs(&r, &["app"], &["app-1-1.x86_64"]);
     }
 
-    // Gap-driver A1 (see [[rum-upstream-research]]): RPM's dependency-overlap
-    // rule compares epoch ONLY when both sides carry one. Require `bash >= 2:5.0`
-    // vs Provide `bash = 5.2` (no epoch) -> RPM/dnf skip the epoch and 5.2 >= 5.0
-    // satisfies. rum currently treats a missing epoch as 0 (0 < 2) and wrongly
-    // rejects. Ignored until Evr carries absent-vs-0 epoch and compare_partial
-    // skips epoch when either side lacks it.
+    // A1 (see [[rum-upstream-research]]): RPM's dependency-overlap rule compares
+    // epoch ONLY when both sides carry one. Require `bash >= 2:5.0` vs Provide
+    // `bash = 5.2` (no epoch) -> RPM/dnf skip the epoch and 5.2 >= 5.0 satisfies.
     #[test]
-    #[ignore = "A1 epoch-overlap: needs Evr absent-epoch; tracked in rum-upstream-research"]
     fn epoch_skipped_in_overlap_when_provide_has_none() {
         let mut r = TestRepo::new();
         r.pkg("app-1-1.x86_64").requires("bash >= 2:5.0");

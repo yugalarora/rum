@@ -39,8 +39,12 @@ pub use vercmp::rpmvercmp;
     rkyv::Deserialize,
 )]
 pub struct Evr {
-    /// A missing epoch is treated as 0 (RPM/dnf convention).
-    pub epoch: u64,
+    /// The epoch, or `None` when absent. RPM distinguishes an absent epoch from
+    /// an explicit `0`: for *label* comparison ("which is newer") both count as
+    /// 0, but for *dependency overlap* the epoch is compared only when BOTH
+    /// sides carry one (see `dep::compare_partial`). `Some(0)` therefore differs
+    /// from `None` there, so the two are kept distinct.
+    pub epoch: Option<u64>,
     pub version: String,
     pub release: String,
 }
@@ -48,19 +52,20 @@ pub struct Evr {
 impl Evr {
     pub fn new(epoch: Option<u64>, version: impl Into<String>, release: impl Into<String>) -> Self {
         Evr {
-            epoch: epoch.unwrap_or(0),
+            epoch,
             version: version.into(),
             release: release.into(),
         }
     }
 
     /// Parse an EVR string of the form `[epoch:]version[-release]`, as stored
-    /// in the rpmdb / repo metadata dependency versions. A missing epoch is 0;
-    /// a missing release is empty (which dep comparison then ignores).
+    /// in the rpmdb / repo metadata dependency versions. A missing epoch is
+    /// `None` (distinct from an explicit `0:`); a missing release is empty
+    /// (which dep comparison then ignores).
     pub fn parse(s: &str) -> Self {
         let (epoch, rest) = match s.split_once(':') {
-            Some((e, r)) => (e.parse::<u64>().unwrap_or(0), r),
-            None => (0, s),
+            Some((e, r)) => (Some(e.parse::<u64>().unwrap_or(0)), r),
+            None => (None, s),
         };
         let (version, release) = match rest.split_once('-') {
             Some((v, r)) => (v.to_string(), r.to_string()),
@@ -73,11 +78,22 @@ impl Evr {
         }
     }
 
-    /// RPM label comparison: epoch first (numerically), then version, then
-    /// release, each with `rpmvercmp`.
+    /// Lossless EVR string for round-tripping through the interned cache:
+    /// unlike [`Display`](std::fmt::Display), it emits `0:` for an explicit
+    /// `Some(0)` so the absent-vs-`0` distinction survives parse.
+    pub fn to_dep_string(&self) -> String {
+        match self.epoch {
+            Some(e) => format!("{}:{}-{}", e, self.version, self.release),
+            None => format!("{}-{}", self.version, self.release),
+        }
+    }
+
+    /// RPM label comparison: epoch first (numerically, absent == 0), then
+    /// version, then release, each with `rpmvercmp`.
     pub fn compare(&self, other: &Evr) -> Ordering {
         self.epoch
-            .cmp(&other.epoch)
+            .unwrap_or(0)
+            .cmp(&other.epoch.unwrap_or(0))
             .then_with(|| rpmvercmp(&self.version, &other.version))
             .then_with(|| rpmvercmp(&self.release, &other.release))
     }
@@ -97,10 +113,10 @@ impl Ord for Evr {
 
 impl std::fmt::Display for Evr {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if self.epoch == 0 {
-            write!(f, "{}-{}", self.version, self.release)
-        } else {
-            write!(f, "{}:{}-{}", self.epoch, self.version, self.release)
+        // User-facing: omit the epoch when absent or 0 (RPM/dnf convention).
+        match self.epoch {
+            Some(e) if e != 0 => write!(f, "{}:{}-{}", e, self.version, self.release),
+            _ => write!(f, "{}-{}", self.version, self.release),
         }
     }
 }
@@ -117,10 +133,14 @@ mod tests {
     }
 
     #[test]
-    fn missing_epoch_is_zero() {
+    fn missing_epoch_compares_as_zero_but_stays_distinct() {
+        // For LABEL comparison an absent epoch counts as 0 (RPM/dnf convention)...
         let a = Evr::new(None, "1.0", "1");
         let b = Evr::new(Some(0), "1.0", "1");
-        assert_eq!(a, b);
+        assert_eq!(a.cmp(&b), Ordering::Equal, "absent epoch == 0 for ordering");
+        // ...but structurally it is kept distinct, because dependency overlap
+        // treats an absent epoch as a wildcard (see dep::compare_partial).
+        assert_ne!(a, b, "None and Some(0) must not be structurally equal");
     }
 
     #[test]
@@ -142,12 +162,23 @@ mod tests {
 
     #[test]
     fn parse_evr_forms() {
-        assert_eq!(Evr::parse("2.34-1"), Evr::new(Some(0), "2.34", "1"));
+        // No `:` -> epoch is None (absent), distinct from an explicit `0:`.
+        assert_eq!(Evr::parse("2.34-1"), Evr::new(None, "2.34", "1"));
         assert_eq!(
             Evr::parse("1:2.34-5.amzn2023"),
             Evr::new(Some(1), "2.34", "5.amzn2023")
         );
-        assert_eq!(Evr::parse("2.34"), Evr::new(Some(0), "2.34", ""));
-        assert_eq!(Evr::parse(""), Evr::new(Some(0), "", ""));
+        assert_eq!(Evr::parse("0:2.34-1"), Evr::new(Some(0), "2.34", "1"));
+        assert_eq!(Evr::parse("2.34"), Evr::new(None, "2.34", ""));
+        assert_eq!(Evr::parse(""), Evr::new(None, "", ""));
+        // Round-trip through the lossless interning string preserves presence.
+        assert_eq!(
+            Evr::parse(&Evr::new(Some(0), "1", "1").to_dep_string()).epoch,
+            Some(0)
+        );
+        assert_eq!(
+            Evr::parse(&Evr::new(None, "1", "1").to_dep_string()).epoch,
+            None
+        );
     }
 }
