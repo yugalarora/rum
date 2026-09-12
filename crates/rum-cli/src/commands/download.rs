@@ -136,6 +136,7 @@ pub fn resolve_packages(packages: &[String], with_deps: bool) -> anyhow::Result<
     // global package index; `offsets[ri]..offsets[ri+1]` is repo ri's range.
     let (packages_out, ids) = {
         let metas = synced.metas();
+        let priorities = synced.priorities();
         let mut offsets = Vec::with_capacity(metas.len() + 1);
         let mut acc = 0usize;
         for m in metas {
@@ -178,6 +179,7 @@ pub fn resolve_packages(packages: &[String], with_deps: bool) -> anyhow::Result<
                     offsets: &offsets,
                     extra: &extra,
                     allow_arches: &allow,
+                    priorities,
                 };
                 resolve_sat_with(targets, &src, &installed)
             };
@@ -199,6 +201,7 @@ pub fn resolve_packages(packages: &[String], with_deps: bool) -> anyhow::Result<
                         offsets: &offsets,
                         extra: &extra,
                         allow_arches: &allow,
+                        priorities,
                     };
                     Ok(resolve_sat_with(targets, &src, &installed)
                         .map_err(|e| anyhow::anyhow!("dependency resolution failed: {e}"))?
@@ -385,6 +388,8 @@ struct MetasSource<'a> {
     /// Package arches to consider (host arch + noarch, plus any explicitly
     /// requested). Packages of other arches are skipped (multilib policy).
     allow_arches: &'a HashSet<String>,
+    /// Repo priority per `metas` index (lower preferred; resolver tie-break).
+    priorities: &'a [i32],
 }
 
 impl CandidateSource for MetasSource<'_> {
@@ -417,6 +422,7 @@ impl CandidateSource for MetasSource<'_> {
                     requires: &requires,
                     recommends: &recommends,
                     conflicts: &conflicts,
+                    priority: self.priorities.get(ri).copied().unwrap_or(99),
                 });
             }
         }

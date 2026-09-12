@@ -13,6 +13,8 @@ pub struct Synced {
     /// read them zero-copy via [`Synced::metas`] (query commands) or
     /// materialize owned packages via [`Synced::owned_packages`] (resolve).
     metas: Vec<RepoMetadata>,
+    /// Repo priority per entry in `metas` (same index), for resolver tie-break.
+    priorities: Vec<i32>,
     /// Per-repo (id, count, from_cache) for reporting.
     pub repos: Vec<RepoStat>,
     /// repo id -> resolved base URL (for building package download URLs).
@@ -27,6 +29,10 @@ impl Synced {
     /// Zero-copy view of every synced repo's archived packages.
     pub fn metas(&self) -> &[RepoMetadata] {
         &self.metas
+    }
+    /// Repo priorities aligned with [`Synced::metas`] (lower is preferred).
+    pub fn priorities(&self) -> &[i32] {
+        &self.priorities
     }
 }
 
@@ -64,13 +70,19 @@ pub fn sync_enabled(force_refresh: bool) -> anyhow::Result<Synced> {
     let results = rum_repo::sync_all(&enabled, &opts);
     let elapsed = start.elapsed();
 
+    let prio_by_id: HashMap<&str, i32> = enabled
+        .iter()
+        .map(|r| (r.id.as_str(), r.priority))
+        .collect();
     let mut metas = Vec::new();
+    let mut priorities = Vec::new();
     let mut repos = Vec::new();
     let mut base_urls = HashMap::new();
     for (id, res) in results {
         match res {
             Ok(md) => {
                 base_urls.insert(id.clone(), md.base_url.clone());
+                priorities.push(prio_by_id.get(id.as_str()).copied().unwrap_or(99));
                 repos.push(RepoStat {
                     id,
                     count: md.len(),
@@ -97,6 +109,7 @@ pub fn sync_enabled(force_refresh: bool) -> anyhow::Result<Synced> {
 
     Ok(Synced {
         metas,
+        priorities,
         repos,
         base_urls,
         clients,

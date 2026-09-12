@@ -53,6 +53,9 @@ pub struct CandidateRef<'a> {
     /// Capabilities this package conflicts with (modeled as solver constraints
     /// forbidding coexistence).
     pub conflicts: &'a [Dep],
+    /// Repo priority (lower preferred; default 99). Used only to tie-break
+    /// provider selection.
+    pub priority: i32,
 }
 
 /// A name-only view of one candidate, for the cheap pre-passes (which capability
@@ -107,6 +110,7 @@ impl CandidateSource for [Candidate] {
                 requires: &c.requires,
                 recommends: &c.recommends,
                 conflicts: &c.conflicts,
+                priority: c.priority,
             });
         }
     }
@@ -143,6 +147,8 @@ struct RpmProvider {
     installed: HashSet<SolvableId>,
     /// solvable -> caller candidate id (only for real repo packages)
     candidate_of: HashMap<SolvableId, usize>,
+    /// solvable -> its package's repo priority (lower preferred; default 99).
+    priority: HashMap<SolvableId, i32>,
     /// solvable -> the underlying package's EVR. Candidate ranking must use the
     /// package version, not the solvable's record (which for a capability
     /// provider is the *provided* version and can tie across package builds).
@@ -400,6 +406,7 @@ fn build<S: CandidateSource + ?Sized>(
     let mut deps: HashMap<SolvableId, Vec<ConditionalRequirement>> = HashMap::new();
     let mut constrains_map: HashMap<SolvableId, Vec<VersionSetId>> = HashMap::new();
     let mut candidate_of: HashMap<SolvableId, usize> = HashMap::new();
+    let mut priority: HashMap<SolvableId, i32> = HashMap::new();
     let mut installed: HashSet<SolvableId> = HashSet::new();
     let mut pkg_evr: HashMap<SolvableId, Evr> = HashMap::new();
     let mut wildcard: HashSet<SolvableId> = HashSet::new();
@@ -505,6 +512,7 @@ fn build<S: CandidateSource + ?Sized>(
             let sid = pool.intern_solvable(cap, rec);
             candidate_of.insert(sid, ci);
             pkg_evr.insert(sid, c.evr.clone());
+            priority.insert(sid, c.priority);
             deps.insert(sid, reqs.clone());
             if !cons.is_empty() {
                 constrains_map.insert(sid, cons.clone());
@@ -543,6 +551,7 @@ fn build<S: CandidateSource + ?Sized>(
         constrains: constrains_map,
         installed,
         candidate_of,
+        priority,
         pkg_evr,
         wildcard,
         conditions,
@@ -646,11 +655,19 @@ impl DependencyProvider for RpmProvider {
         solvables.sort_by(|a, b| {
             let ia = self.installed.contains(a);
             let ib = self.installed.contains(b);
-            ib.cmp(&ia).then_with(|| {
-                let ra = self.pkg_evr.get(a).unwrap_or(&zero);
-                let rb = self.pkg_evr.get(b).unwrap_or(&zero);
-                rb.cmp(ra)
-            })
+            // installed first, then higher repo priority (lower number), then
+            // higher package EVR — matching dnf (priority trumps version).
+            ib.cmp(&ia)
+                .then_with(|| {
+                    let pa = self.priority.get(a).copied().unwrap_or(99);
+                    let pb = self.priority.get(b).copied().unwrap_or(99);
+                    pa.cmp(&pb)
+                })
+                .then_with(|| {
+                    let ra = self.pkg_evr.get(a).unwrap_or(&zero);
+                    let rb = self.pkg_evr.get(b).unwrap_or(&zero);
+                    rb.cmp(ra)
+                })
         });
     }
 
@@ -872,6 +889,7 @@ mod tests {
             requires: requires.to_vec(),
             recommends: Vec::new(),
             conflicts: Vec::new(),
+            priority: 99,
         }
     }
 
@@ -965,6 +983,18 @@ mod tests {
         );
     }
 
+    // B3 (tie-breaking): capX has two providers — pv-2.0 (newer, low-priority
+    // repo 99) and pv-1.0 (older, high-priority repo 1). dnf lets repo priority
+    // trump version, so the higher-priority (lower-number) pv-1.0 must win.
+    #[test]
+    fn higher_priority_repo_wins_over_higher_version() {
+        let mut r = TestRepo::new();
+        r.pkg("app-1-1.x86_64").requires("capX");
+        r.pkg("pv-2.0-1.x86_64").provides("capX").priority(99);
+        r.pkg("pv-1.0-1.x86_64").provides("capX").priority(1);
+        assert_installs(&r, &["app"], &["app-1-1.x86_64", "pv-1.0-1.x86_64"]);
+    }
+
     // A1 (see [[rum-upstream-research]]): RPM's dependency-overlap rule compares
     // epoch ONLY when both sides carry one. Require `bash >= 2:5.0` vs Provide
     // `bash = 5.2` (no epoch) -> RPM/dnf skip the epoch and 5.2 >= 5.0 satisfies.
@@ -997,6 +1027,7 @@ mod tests {
             requires: vec![vprov("lib(x86-64)", "1.0"), vprov("tool(x86-64)", "1.0")],
             recommends: vec![],
             conflicts: vec![],
+            priority: 99,
         };
         // lib and tool each carry a versioned arch-qualified provide.
         let lib = Candidate {
@@ -1008,6 +1039,7 @@ mod tests {
             requires: vec![],
             recommends: vec![],
             conflicts: vec![],
+            priority: 99,
         };
         let tool = Candidate {
             id: 2,
@@ -1018,6 +1050,7 @@ mod tests {
             requires: vec![],
             recommends: vec![],
             conflicts: vec![],
+            priority: 99,
         };
         let r = resolve_sat(&["app".into()], &[app, lib, tool], &[])
             .unwrap()
@@ -1078,6 +1111,7 @@ mod tests {
             }],
             recommends: vec![],
             conflicts: vec![],
+            priority: 99,
         };
         let prov = Candidate {
             id: 1,
@@ -1092,6 +1126,7 @@ mod tests {
             requires: vec![],
             recommends: vec![],
             conflicts: vec![],
+            priority: 99,
         };
         let r = resolve_sat(&["app".into()], &[app, prov], &[])
             .unwrap()

@@ -27,6 +27,10 @@ pub struct Candidate {
     /// Capabilities this package conflicts with: it cannot coexist with a
     /// package matching these (modeled as a solver constraint). Empty for most.
     pub conflicts: Vec<Dep>,
+    /// Repo priority (lower is preferred; dnf default 99). Among candidates,
+    /// a higher-priority repo wins over a lower-priority one even at a lower
+    /// version — matching dnf's `priority=`.
+    pub priority: i32,
 }
 
 /// The outcome of a resolve: the candidate ids to install, in a stable order.
@@ -258,6 +262,7 @@ mod tests {
             requires: requires.to_vec(),
             recommends: Vec::new(),
             conflicts: Vec::new(),
+            priority: 99,
         }
     }
 
@@ -344,6 +349,7 @@ mod tests {
                 }],
                 recommends: Vec::new(),
                 conflicts: Vec::new(),
+                priority: 99,
             },
             cand(2, "glibc", "2.40", &[], &[]),
         ];

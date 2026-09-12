@@ -52,6 +52,7 @@ impl TestRepo {
             requires: Vec::new(),
             recommends: Vec::new(),
             conflicts: Vec::new(),
+            priority: 99,
         });
         PkgB {
             c: self.avail.last_mut().unwrap(),
@@ -104,6 +105,11 @@ impl PkgB<'_> {
     }
     pub fn conflicts(self, d: &str) -> Self {
         self.c.conflicts.push(parse_dep(d));
+        self
+    }
+    /// Set the package's repo priority (lower is preferred; default 99).
+    pub fn priority(self, p: i32) -> Self {
+        self.c.priority = p;
         self
     }
 }
