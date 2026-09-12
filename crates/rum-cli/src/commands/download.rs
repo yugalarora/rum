@@ -367,6 +367,48 @@ pub fn resolve_packages(packages: &[String], with_deps: bool) -> anyhow::Result<
                         }
                     }
                 }
+
+                // Install-only semantics (kernels): a requested install-only
+                // package installs the NEWEST available build ALONGSIDE existing
+                // ones, so the resolver treating an installed build as
+                // "satisfied" is wrong here. If a newer build than what's
+                // installed exists, pull it in explicitly (commit then prunes to
+                // installonly_limit).
+                for spec in &requested {
+                    let mut best: Option<(usize, Evr)> = None;
+                    for (ri, m) in metas.iter().enumerate() {
+                        for (pi, p) in m.views().enumerate() {
+                            if p.name() != spec {
+                                continue;
+                            }
+                            let is_io = matches!(p.name(), "kernel" | "kernel-core")
+                                || p.provide_names()
+                                    .iter()
+                                    .any(|n| n.starts_with("installonlypkg("));
+                            if !is_io {
+                                continue;
+                            }
+                            let evr = p.evr_cmp();
+                            if best.as_ref().map_or(true, |(_, b)| evr > *b) {
+                                best = Some((offsets[ri] + pi, evr));
+                            }
+                        }
+                    }
+                    if let Some((gid, evr)) = best {
+                        let newest_installed = db
+                            .by_name(spec)
+                            .iter()
+                            .map(|q| Evr::new(q.epoch, &q.version, &q.release))
+                            .max();
+                        let newer = newest_installed.as_ref().map_or(true, |ni| evr > *ni);
+                        if newer && !seen.contains(spec) {
+                            if let Some(pkg) = rehydrate(gid) {
+                                seen.insert(spec.clone());
+                                winners.push(pkg);
+                            }
+                        }
+                    }
+                }
             }
         }
 

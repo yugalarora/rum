@@ -614,8 +614,10 @@ mod imp {
             })
         }
 
-        /// Queue an install/upgrade of the RPM at `path`.
-        pub fn add_install(&mut self, path: &Path) -> Result<(), RpmError> {
+        /// Queue an install of the RPM at `path`. `upgrade=true` (the normal
+        /// case) makes rpm replace older builds of the same name; `false` adds
+        /// it alongside them (install-only semantics, e.g. kernels).
+        pub fn add_install(&mut self, path: &Path, upgrade: bool) -> Result<(), RpmError> {
             let path_str = path.to_string_lossy().into_owned();
             let cpath = CString::new(path_str.clone()).map_err(|_| RpmError::PackageRead {
                 path: path_str.clone(),
@@ -663,7 +665,8 @@ mod imp {
                 // handed back to the notify callback.
                 self.keys.push(cpath);
                 let key = self.keys.last().unwrap().as_ptr() as *const c_void;
-                let added = ffi::rpmtsAddInstallElement(self.ts, h, key, 1, ptr::null_mut());
+                let upg = if upgrade { 1 } else { 0 };
+                let added = ffi::rpmtsAddInstallElement(self.ts, h, key, upg, ptr::null_mut());
                 ffi::headerFree(h);
                 if added != 0 {
                     self.keys.pop();
@@ -885,7 +888,7 @@ impl Transaction {
     pub fn new() -> Result<Self, RpmError> {
         Err(RpmError::Unsupported)
     }
-    pub fn add_install(&mut self, _path: &std::path::Path) -> Result<(), RpmError> {
+    pub fn add_install(&mut self, _path: &std::path::Path, _upgrade: bool) -> Result<(), RpmError> {
         Err(RpmError::Unsupported)
     }
     pub fn add_erase(&mut self, _name: &str) -> Result<(), RpmError> {
